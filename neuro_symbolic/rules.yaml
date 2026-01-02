@@ -1,0 +1,96 @@
+types:
+  Object: {}
+  Furniture: {}
+  Structure: {}
+  Place: {}
+  Animal: {}
+  BodyPart: {}
+
+is_a:
+  - [ball, Object]
+  - [basket, Object]
+  - [car, Object]
+  - [cat, Animal]
+  - [chair, Furniture]
+  - [computer, Object]
+  - [crib, Furniture]
+  - [door, Structure]
+  - [floor, Place]
+  - [foot, BodyPart]
+  - [ground, Place]
+  - [hand, BodyPart]
+  - [kitchen, Place]
+  - [paper, Object]
+  - [puzzle, Object]
+  - [road, Place]
+  - [room, Place]
+  - [sand, Place]
+  - [stairs, Structure]
+  - [table, Furniture]
+  - [toy, Object]
+  - [window, Structure]
+
+  - [dog, Animal]
+  - [bird, Animal]
+  - [duck, Animal]
+  - [cow, Animal]
+  - [horse, Animal]
+  - [sheep, Animal]
+  - [pig, Animal]
+  - [bunny, Animal]
+  - [chicken, Animal]
+
+  - [book, Object]
+  - [bottle, Object]
+  - [cup, Object]
+  - [spoon, Object]
+  - [plate, Object]
+  - [bowl, Object]
+  - [bucket, Object]
+  - [train, Object]
+  - [truck, Object]
+  - [shoe, Object]
+
+  - [bed, Furniture]
+  - [sofa, Furniture]
+  - [couch, Furniture]
+
+  - [house, Structure]
+  - [park, Place]
+  - [playground, Place]
+  - [beach, Place]
+  - [garden, Place]
+
+aliases:
+  - [kitty, cat]
+  - [kitties, cat]
+  - [kitten, cat]
+  - [doggy, dog]
+  - [doggie, dog]
+  - [doggies, dog]
+  - [cars, car]
+  - [hands, hand]
+  - [feet, foot]
+  - [wheels, wheel]
+  - [tables, table]
+  - [stairs, stairs]
+  - [birdies, bird]
+
+disjoint:
+  - [Animal, Place]
+  - [Animal, Furniture]
+  - [BodyPart, Object]
+  - [BodyPart, Place]
+  - [Place, Object]
+
+part_of:
+  - [door, room]
+  - [window, room]
+  - [floor, room]
+  - [stairs, house]
+  - [wheel, car]
+  - [handle, cup]
+
+attributes:
+  color: [red, blue, green, yellow, black, white, brown, orange, purple, pink]
+  shape: [round, square, circle, triangle]
