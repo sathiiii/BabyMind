@@ -4,11 +4,11 @@
 
 This repository contains the code used for BabyMind, an object-first extension of Child-View Contrastive Learning (CVCL) for learning grounded word meaning from child-view video paired with caregiver speech.
 
-BabyMind keeps the CVCL global image--text contrastive objective and adds an object-file pathway: offline mask candidates, short-window object files, prototype-space multiple-instance contrastive alignment, track-coherence regularization, and global-object agreement.
+BabyMind keeps the CVCL global image-text contrastive objective and adds an object-file pathway: offline mask candidates, short-window object files, prototype-space multiple-instance contrastive alignment, track-coherence regularization, and global-object agreement.
 
 ## Repository status
 
-This release is intended for the arXiv / CogSci paper. It contains source code, training/evaluation scripts, and configuration-style shell wrappers. It does **not** include SAYCam videos/frames, extracted masks, checkpoints, or logs.
+This release is intended for the CogSci paper. It contains source code, training/evaluation scripts, and configuration-style shell wrappers. It does **not** include SAYCam videos/frames, extracted masks, checkpoints, or logs.
 
 SAYCam-derived data cannot be redistributed here. Researchers should obtain the original SAYCam/SAYCam-S data through the appropriate data-use process and then prepare the local directory layout described below.
 
