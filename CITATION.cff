@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+title: "BabyMind: Objects Before Words"
+message: "If you use this code, please cite the BabyMind arXiv/CogSci paper."
+type: software
+authors:
+  - family-names: Silva
+    given-names: Sathira
+repository-code: "https://github.com/sathiiii/BabyMind"
+license: MIT
+version: 0.1.0
+date-released: 2026-01-01

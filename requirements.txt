@@ -1,16 +1,25 @@
-numpy
-scipy
-matplotlib
-torch
-torchvision
-imageio
-Pillow
-opencv-python
-pandas
-pytorch-lightning
-torchinfo
-gsheets
-wandb
-pycocoevalcap
-clip
-spacy
+# Core runtime. For a fully pinned environment, prefer: uv sync
+# or install from pyproject.toml with: pip install -e '.[masking,dev]'
+torch==2.4.0
+torchvision==0.19.0
+numpy==1.24.4
+scipy==1.10.1
+matplotlib==3.7.5
+opencv-python==4.9.0.80
+pandas==2.0.3
+Pillow==10.3.0
+pytorch-lightning==1.6.0
+torchinfo==1.8.0
+spacy==3.7.4
+huggingface-hub>=0.28.1
+transformers>=4.40,<5
+tqdm>=4.66
+imageio>=2.34
+wandb==0.16.5
+pycocoevalcap==1.2
+gsheets==0.6
+ftfy>=6.1
+regex>=2023.0.0
+# Mask extraction / OpenAI CLIP helpers:
+# git+https://github.com/facebookresearch/segment-anything.git
+# git+https://github.com/openai/CLIP.git

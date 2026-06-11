@@ -1,14 +1,40 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""
+Prepack SAM mask NPZ files into per-frame .pt tensors (filename-driven, no JSONL).
+
+Input:
+  <output_dir>/npz/obj/*.npz
+
+Expected filename pattern (both are supported):
+  <frame_base>_obj_<label>_<NNN>.npz
+  <frame_base>_obj_<label>_<NNN>_<run_tag...>.npz
+
+Outputs (default):
+  <output_dir>/sam_prepacked/
+    - <frame_base>.pt                      # dict: {"masks": uint8[M,H,W], "concept_ids": int16[M]}
+    - concept_vocab.json                   # {"concepts": [id->label]}
+    - sam_prepacked_index.json             # {frame_base: "<frame_base>.pt"}
+    - concept_frequency.json               # parsed and packed label counts + debug stats
+
+Notes:
+- No aliasing. Labels come directly from filenames.
+- Optional: --canonical-only will only pack the 15 canonical Labeled-S object labels (still reports all parsed labels).
+- Resume-friendly:
+    * If concept_vocab.json exists, it is loaded and IDs are kept stable.
+    * Existing <frame_base>.pt files are skipped unless --overwrite is set.
+"""
+
 import argparse
 import json
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable, Any
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-
 import torch
 
 # Try to import image size from your data module
@@ -19,94 +45,95 @@ except Exception:
     IMAGE_W = None
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Prepack SAM mask npz files into per-frame .pt tensors "
-            "for fast loading at training time."
-        )
-    )
+# Canonical 15 (ordering only; NOT aliasing)
+CANONICAL_15: List[str] = [
+    "ball", "basket", "car", "cat", "chair", "computer", "crib", "door",
+    "foot", "hand", "paper", "puzzle", "stairs", "table", "window",
+]
+CANONICAL_15_SET = set(CANONICAL_15)
 
-    parser.add_argument(
+# Robust parse:
+#   frame_base = group(1)
+#   label      = group(2)
+#   inst       = group(3) (unused)
+# Works for both "..._000.npz" and "..._000_<tag>.npz"
+_STEM_RE = re.compile(r"^(?P<frame>.+?)_obj_(?P<label>.+?)_(?P<inst>\d{3})(?:_.*)?$")
+
+
+@dataclass(frozen=True)
+class MaskFile:
+    path: Path
+    frame_base: str
+    label: str
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Prepack SAM mask npz files into per-frame .pt tensors (from filenames, no JSONL)."
+    )
+    p.add_argument(
         "--output-dir",
         type=str,
         required=True,
-        help=(
-            "Root output directory used by the GDINO+SAM+CLIP script "
-            "(same as its --output-dir). This is where npz and index JSONL live."
-        ),
+        help="Root output directory that contains npz/obj (same as miner --output-dir).",
     )
-    parser.add_argument(
-        "--index-jsonl",
+    p.add_argument(
+        "--npz-obj-dir",
         type=str,
-        action="append",
         default=None,
-        help=(
-            "Path to a gdino_sam_clip_multi_index_rank*.jsonl file. "
-            "Can be given multiple times. If omitted, the script will "
-            "search under --output-dir for files matching that pattern."
-        ),
+        help="Optional override for NPZ folder. Default: <output-dir>/npz/obj",
     )
-    parser.add_argument(
+    p.add_argument(
+        "--npz-glob",
+        type=str,
+        default="*.npz",
+        help="Glob under npz-obj-dir (default: *.npz). Use '**/*.npz' if nested.",
+    )
+    p.add_argument(
         "--prepacked-dir",
         type=str,
         default=None,
-        help=(
-            "Directory where prepacked .pt files and vocab/index JSON will be saved. "
-            "Default: <output-dir>/sam_prepacked"
-        ),
+        help="Where to write prepacked outputs. Default: <output-dir>/sam_prepacked",
     )
-    parser.add_argument(
+    p.add_argument(
         "--image-height",
         type=int,
         default=None,
         help="Target image height. If not set, falls back to IMAGE_H from data module.",
     )
-    parser.add_argument(
+    p.add_argument(
         "--image-width",
         type=int,
         default=None,
         help="Target image width. If not set, falls back to IMAGE_W from data module.",
     )
-    parser.add_argument(
+    p.add_argument(
+        "--canonical-only",
+        action="store_true",
+        help="Only pack masks whose filename label is one of the 15 canonical Labeled-S object labels.",
+    )
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing <frame_base>.pt files (default: skip if exists).",
+    )
+    p.add_argument(
         "--path-prefix",
         type=str,
         default=None,
-        help=(
-            "Optional prefix to prepend to mask_path if the stored path "
-            "is not found on disk."
-        ),
+        help="Optional prefix to try if a mask path is not found (rare when scanning a directory).",
     )
-
-    args = parser.parse_args()
-    return args
+    return p.parse_args()
 
 
 def resolve_image_size(args: argparse.Namespace) -> Tuple[int, int]:
     h = args.image_height if args.image_height is not None else IMAGE_H
     w = args.image_width if args.image_width is not None else IMAGE_W
-
     if h is None or w is None:
         raise RuntimeError(
-            "Image size is not specified. Either pass --image-height/--image-width "
-            "or ensure IMAGE_H/IMAGE_W can be imported from multimodal.multimodal_data_module."
+            "Image size not specified. Pass --image-height/--image-width or ensure IMAGE_H/IMAGE_W can be imported."
         )
     return int(h), int(w)
-
-
-def find_index_files(output_dir: Path, explicit: Optional[List[str]]) -> List[Path]:
-    if explicit:
-        return [Path(p) for p in explicit]
-
-    # Default: glob for rank JSONLs
-    pattern = "gdino_sam_clip_multi_index_rank*.jsonl"
-    files = sorted(output_dir.glob(pattern))
-    if not files:
-        raise FileNotFoundError(
-            f"No index JSONL files found in {output_dir} matching {pattern}. "
-            "Pass them explicitly with --index-jsonl."
-        )
-    return files
 
 
 def safe_load_mask_npz(
@@ -116,254 +143,322 @@ def safe_load_mask_npz(
     path_prefix: Optional[Path] = None,
 ) -> Optional[np.ndarray]:
     """
-    Load a single mask from a .npz file and resize to (target_h, target_w).
-    Returns (H, W) uint8 array in {0, 1}, or None on failure.
+    Loads 'mask' from a .npz and returns uint8 array (H,W) in {0,1}, resized to (target_h,target_w).
     """
-    if not mask_path.is_file():
+    p = mask_path
+    if not p.is_file():
         if path_prefix is not None:
-            mask_path = path_prefix / mask_path
-        if not mask_path.is_file():
-            print(f"[WARN] mask npz not found: {mask_path}")
+            p2 = path_prefix / p
+            if p2.is_file():
+                p = p2
+        if not p.is_file():
             return None
 
     try:
-        data = np.load(mask_path)
-    except Exception as e:
-        print(f"[WARN] failed to load npz {mask_path}: {e}")
+        data = np.load(p)
+    except Exception:
         return None
 
     if "mask" not in data:
-        print(f"[WARN] 'mask' key not found in {mask_path}")
         return None
 
     m = np.asarray(data["mask"])
 
-    # Convert to float and normalize if needed
-    m = m.astype(np.float32)
-    if m.max() > 1.0:
-        m = m / 255.0
-
-    # Resize if shape mismatch
-    if m.shape != (target_h, target_w):
-        img = Image.fromarray((m * 255.0).astype(np.uint8))
-        img = img.resize((target_w, target_h), resample=Image.NEAREST)
-        m = np.array(img, dtype=np.uint8)
-        m = (m > 127).astype(np.uint8)
+    # Normalize to uint8 {0,1}
+    if m.dtype == np.bool_:
+        m_u8 = m.astype(np.uint8)
     else:
-        m = (m > 0.5).astype(np.uint8)
+        m2 = m
+        if m2.dtype != np.uint8:
+            # handle float/other
+            m2 = m2.astype(np.float32)
+            # if looks like 0..255, normalize
+            if float(np.max(m2)) > 1.5:
+                m2 = m2 / 255.0
+            m_u8 = (m2 > 0.5).astype(np.uint8)
+        else:
+            # uint8: could be {0,1} or {0,255}
+            mx = int(m2.max()) if m2.size else 0
+            if mx > 1:
+                m_u8 = (m2 > 127).astype(np.uint8)
+            else:
+                m_u8 = (m2 > 0).astype(np.uint8)
 
-    return m
+    # Resize if needed
+    if m_u8.shape != (target_h, target_w):
+        img = Image.fromarray(m_u8 * 255)
+        img = img.resize((target_w, target_h), resample=Image.NEAREST)
+        m_u8 = (np.array(img, dtype=np.uint8) > 127).astype(np.uint8)
 
-
-def frame_to_safe_name(frame_relpath: str) -> str:
-    """
-    Convert a frame_relpath like 'sub1/train/frame_0001.jpg'
-    to a safe base name such as 'sub1_train_frame_0001'.
-    """
-    base = frame_relpath.replace(os.sep, "_")
-    base = base.split(".")[0]
-    return base
-
-
-def process_frame_entries(
-    frame_relpath: str,
-    entries: List[Dict[str, Any]],
-    prepacked_dir: Path,
-    concept2id: Dict[str, int],
-    frame_index: Dict[str, str],
-    target_h: int,
-    target_w: int,
-    path_prefix: Optional[Path],
-) -> None:
-    """
-    Given all index entries for a single frame, load masks, map labels to IDs,
-    and write a single .pt file for that frame.
-    """
-    if not entries:
-        return
-
-    safe_name = frame_to_safe_name(frame_relpath)
-    out_path = prepacked_dir / f"{safe_name}.pt"
-
-    # Skip if already done (useful for resume).
-    if out_path.is_file():
-        frame_index[frame_relpath] = out_path.name
-        return
-
-    masks: List[np.ndarray] = []
-    concept_ids: List[int] = []
-
-    for entry in entries:
-        clip_label = entry.get("concept_clip")
-        mask_path_str = entry.get("mask_path")
-
-        if not clip_label or not mask_path_str:
-            continue
-
-        mask_path = Path(mask_path_str)
-        m = safe_load_mask_npz(mask_path, target_h, target_w, path_prefix=path_prefix)
-        if m is None:
-            continue
-
-        # Assign concept ID
-        if clip_label not in concept2id:
-            concept2id[clip_label] = len(concept2id)
-        cid = concept2id[clip_label]
-
-        masks.append(m)
-        concept_ids.append(cid)
-
-    if not masks:
-        # No valid masks for this frame
-        return
-
-    masks_arr = np.stack(masks, axis=0)  # (M, H, W)
-    cids_arr = np.array(concept_ids, dtype=np.int16)
-
-    tensors = {
-        "masks": torch.from_numpy(masks_arr),        # uint8 [M, H, W]
-        "concept_ids": torch.from_numpy(cids_arr),   # int16 [M]
-    }
-
-    torch.save(tensors, out_path)
-    frame_index[frame_relpath] = out_path.name
+    return m_u8
 
 
-def process_index_file(
-    index_path: Path,
-    prepacked_dir: Path,
-    concept2id: Dict[str, int],
-    frame_index: Dict[str, str],
-    target_h: int,
-    target_w: int,
-    path_prefix: Optional[Path],
-) -> None:
-    """
-    Stream through one JSONL index file and prepack masks frame by frame.
-    Assumes that all entries for a given frame_relpath are contiguous
-    (which is true for the GDINO+SAM+CLIP script).
-    """
-    print(f"[INFO] Processing index JSONL: {index_path}")
-
-    current_frame: Optional[str] = None
-    buffer: List[Dict[str, Any]] = []
-
-    with index_path.open("r") as f:
-        for line in tqdm(f, desc=index_path.name):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            frame_relpath = entry.get("frame_relpath")
-            if not frame_relpath:
-                continue
-
-            # If we are still on the same frame, just accumulate
-            if current_frame is None:
-                current_frame = frame_relpath
-
-            if frame_relpath != current_frame:
-                # Flush previous frame
-                process_frame_entries(
-                    current_frame,
-                    buffer,
-                    prepacked_dir,
-                    concept2id,
-                    frame_index,
-                    target_h,
-                    target_w,
-                    path_prefix,
-                )
-                buffer = []
-                current_frame = frame_relpath
-
-            buffer.append(entry)
-
-    # Flush last frame
-    if current_frame is not None and buffer:
-        process_frame_entries(
-            current_frame,
-            buffer,
-            prepacked_dir,
-            concept2id,
-            frame_index,
-            target_h,
-            target_w,
-            path_prefix,
-        )
+def parse_mask_file(p: Path) -> Optional[MaskFile]:
+    stem = p.stem
+    m = _STEM_RE.match(stem)
+    if not m:
+        return None
+    frame_base = m.group("frame")
+    label = m.group("label").strip().lower()
+    if not frame_base or not label:
+        return None
+    return MaskFile(path=p, frame_base=frame_base, label=label)
 
 
-def save_concept_vocab(prepacked_dir: Path, concept2id: Dict[str, int]) -> None:
-    if not concept2id:
-        print("[WARN] No concepts encountered, not writing concept_vocab.json")
-        return
-
-    # Build id_to_concept in index order
-    id_to_concept = [None] * len(concept2id)
-    for name, idx in concept2id.items():
-        id_to_concept[idx] = name
-
-    vocab = {
-        "concepts": id_to_concept,
-    }
-
+def load_existing_vocab(prepacked_dir: Path) -> Optional[List[str]]:
     vocab_path = prepacked_dir / "concept_vocab.json"
-    with vocab_path.open("w") as f:
-        json.dump(vocab, f, indent=2)
-    print(f"[INFO] Wrote concept vocabulary to {vocab_path}")
+    if not vocab_path.is_file():
+        return None
+    try:
+        obj = json.loads(vocab_path.read_text())
+    except Exception:
+        return None
+    concepts = obj.get("concepts", None)
+    if not isinstance(concepts, list) or not all(isinstance(x, str) for x in concepts):
+        return None
+    return [str(x) for x in concepts]
+
+
+def load_existing_frame_index(prepacked_dir: Path) -> Dict[str, str]:
+    idx_path = prepacked_dir / "sam_prepacked_index.json"
+    if not idx_path.is_file():
+        return {}
+    try:
+        obj = json.loads(idx_path.read_text())
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in obj.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def build_vocab_from_labels(labels: Iterable[str]) -> List[str]:
+    labels_set = {str(x).strip().lower() for x in labels if str(x).strip()}
+    ordered: List[str] = []
+    for c in CANONICAL_15:
+        if c in labels_set:
+            ordered.append(c)
+    for c in sorted(labels_set - set(ordered)):
+        ordered.append(c)
+    return ordered
+
+
+def save_concept_vocab(prepacked_dir: Path, id_to_concept: List[str]) -> None:
+    vocab_path = prepacked_dir / "concept_vocab.json"
+    payload = {"concepts": list(id_to_concept)}
+    vocab_path.write_text(json.dumps(payload, indent=2))
+    print(f"[INFO] Wrote: {vocab_path}")
 
 
 def save_frame_index(prepacked_dir: Path, frame_index: Dict[str, str]) -> None:
-    if not frame_index:
-        print("[WARN] No frames were packed, not writing sam_prepacked_index.json")
-        return
+    idx_path = prepacked_dir / "sam_prepacked_index.json"
+    idx_path.write_text(json.dumps(frame_index, indent=2))
+    print(f"[INFO] Wrote: {idx_path}")
 
-    index_path = prepacked_dir / "sam_prepacked_index.json"
-    with index_path.open("w") as f:
-        json.dump(frame_index, f, indent=2)
-    print(f"[INFO] Wrote frame index to {index_path}")
+
+def save_concept_frequency(
+    prepacked_dir: Path,
+    *,
+    npz_dir: Path,
+    npz_glob: str,
+    total_npz_files: int,
+    matched_pattern: int,
+    bad_pattern_files: List[str],
+    parsed_counts: Dict[str, int],
+    packed_counts: Dict[str, int],
+    total_packed_masks: int,
+    failed_npz_loads: int,
+    canonical_only: bool,
+) -> None:
+    out_path = prepacked_dir / "concept_frequency.json"
+
+    def _sorted_counts(d: Dict[str, int]) -> Dict[str, int]:
+        items = sorted(d.items(), key=lambda kv: (-int(kv[1]), kv[0]))
+        return {k: int(v) for k, v in items}
+
+    payload: Dict[str, Any] = {
+        "npz_dir": str(npz_dir),
+        "npz_glob": str(npz_glob),
+        "total_npz_files": int(total_npz_files),
+        "matched_filename_pattern": int(matched_pattern),
+        "bad_pattern_files": int(len(bad_pattern_files)),
+        "example_bad_pattern_files": bad_pattern_files[:50],
+        "canonical_only": bool(canonical_only),
+        "total_masks_packed": int(total_packed_masks),
+        "failed_npz_loads": int(failed_npz_loads),
+        "counts_parsed_from_filenames": _sorted_counts(parsed_counts),
+        "counts_packed_successfully": _sorted_counts(packed_counts),
+    }
+
+    out_path.write_text(json.dumps(payload, indent=2))
+    print(f"[INFO] Wrote: {out_path}")
+
+
+def group_by_frame(records: List[MaskFile]) -> Iterable[Tuple[str, List[MaskFile]]]:
+    if not records:
+        return
+    # records are expected sorted by frame_base already
+    cur_frame = records[0].frame_base
+    buf: List[MaskFile] = []
+    for r in records:
+        if r.frame_base != cur_frame:
+            yield cur_frame, buf
+            buf = []
+            cur_frame = r.frame_base
+        buf.append(r)
+    if buf:
+        yield cur_frame, buf
 
 
 def main() -> None:
     args = parse_args()
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.npz_obj_dir is None:
+        npz_dir = output_dir / "npz" / "obj"
+    else:
+        npz_dir = Path(args.npz_obj_dir)
 
     if args.prepacked_dir is None:
         prepacked_dir = output_dir / "sam_prepacked"
     else:
         prepacked_dir = Path(args.prepacked_dir)
+
     prepacked_dir.mkdir(parents=True, exist_ok=True)
 
     target_h, target_w = resolve_image_size(args)
-
-    index_files = find_index_files(output_dir, args.index_jsonl)
     path_prefix = Path(args.path_prefix) if args.path_prefix is not None else None
 
-    # Global mappings
-    concept2id: Dict[str, int] = {}
-    frame_index: Dict[str, str] = {}
+    if not npz_dir.is_dir():
+        raise FileNotFoundError(f"NPZ dir not found: {npz_dir}")
 
-    for index_path in index_files:
-        process_index_file(
-            index_path=index_path,
-            prepacked_dir=prepacked_dir,
-            concept2id=concept2id,
-            frame_index=frame_index,
-            target_h=target_h,
-            target_w=target_w,
-            path_prefix=path_prefix,
+    npz_files = sorted(npz_dir.glob(args.npz_glob))
+    if not npz_files:
+        raise FileNotFoundError(f"No NPZ files found under {npz_dir} with glob '{args.npz_glob}'")
+
+    # Resume safety:
+    existing_pt = list(prepacked_dir.glob("*.pt"))
+    existing_vocab = load_existing_vocab(prepacked_dir)
+    if existing_pt and existing_vocab is None and not args.overwrite:
+        raise RuntimeError(
+            f"Found existing .pt files in {prepacked_dir} but concept_vocab.json is missing.\n"
+            f"To avoid ID mismatches, either delete {prepacked_dir} and re-run, or run with --overwrite."
         )
 
-    save_concept_vocab(prepacked_dir, concept2id)
+    # Parse all filenames
+    records: List[MaskFile] = []
+    bad_pattern: List[str] = []
+    parsed_counts: Dict[str, int] = {}
+
+    matched = 0
+    for p in tqdm(npz_files, desc="Parsing NPZ filenames"):
+        mf = parse_mask_file(p)
+        if mf is None:
+            bad_pattern.append(str(p))
+            continue
+        matched += 1
+        parsed_counts[mf.label] = parsed_counts.get(mf.label, 0) + 1
+        records.append(mf)
+
+    if not records:
+        raise RuntimeError("No NPZ files matched the expected '*_obj_<label>_<NNN>*' filename pattern.")
+
+    # Optional filter for packing
+    if args.canonical_only:
+        records_pack = [r for r in records if r.label in CANONICAL_15_SET]
+    else:
+        records_pack = records
+
+    # Build / load vocab
+    if existing_vocab is not None and not args.overwrite:
+        id_to_concept = existing_vocab
+        concept2id = {c: i for i, c in enumerate(id_to_concept)}
+        print(f"[INFO] Loaded existing vocab with {len(id_to_concept)} concepts from {prepacked_dir / 'concept_vocab.json'}")
+    else:
+        # Deterministic vocab (canonical first, then sorted extras)
+        labels_for_vocab = {r.label for r in records_pack} if records_pack else set()
+        id_to_concept = build_vocab_from_labels(labels_for_vocab)
+        concept2id = {c: i for i, c in enumerate(id_to_concept)}
+        print(f"[INFO] Built new vocab with {len(id_to_concept)} concepts")
+
+    # Load existing index (resume)
+    frame_index = {} if args.overwrite else load_existing_frame_index(prepacked_dir)
+
+    # Sort by frame_base so grouping is contiguous
+    records_pack.sort(key=lambda r: (r.frame_base, r.label, r.path.name))
+
+    packed_counts: Dict[str, int] = {}
+    total_packed_masks = 0
+    failed_npz_loads = 0
+
+    # Pack per frame
+    frame_groups = list(group_by_frame(records_pack))
+    for frame_base, items in tqdm(frame_groups, desc="Packing frames"):
+        out_path = prepacked_dir / f"{frame_base}.pt"
+
+        if out_path.is_file() and not args.overwrite:
+            frame_index[frame_base] = out_path.name
+            continue
+
+        masks: List[np.ndarray] = []
+        cids: List[int] = []
+
+        for mf in items:
+            m = safe_load_mask_npz(mf.path, target_h, target_w, path_prefix=path_prefix)
+            if m is None:
+                failed_npz_loads += 1
+                continue
+
+            # ensure label in vocab (if overwriting + new label appears)
+            if mf.label not in concept2id:
+                # append at end deterministically (rare; happens if vocab loaded but new labels exist)
+                concept2id[mf.label] = len(id_to_concept)
+                id_to_concept.append(mf.label)
+
+            cid = int(concept2id[mf.label])
+            masks.append(m)
+            cids.append(cid)
+
+            packed_counts[mf.label] = packed_counts.get(mf.label, 0) + 1
+            total_packed_masks += 1
+
+        if not masks:
+            # nothing valid for this frame
+            continue
+
+        masks_arr = np.stack(masks, axis=0).astype(np.uint8)  # [M,H,W]
+        cids_arr = np.asarray(cids, dtype=np.int16)           # [M]
+
+        tensors = {
+            "masks": torch.from_numpy(masks_arr),          # uint8
+            "concept_ids": torch.from_numpy(cids_arr),     # int16
+        }
+        torch.save(tensors, out_path)
+        frame_index[frame_base] = out_path.name
+
+    # Save metadata
+    save_concept_vocab(prepacked_dir, id_to_concept)
     save_frame_index(prepacked_dir, frame_index)
 
-    print(f"[INFO] Done. Prepacked .pt files are in {prepacked_dir}")
+    save_concept_frequency(
+        prepacked_dir,
+        npz_dir=npz_dir,
+        npz_glob=args.npz_glob,
+        total_npz_files=len(npz_files),
+        matched_pattern=matched,
+        bad_pattern_files=bad_pattern,
+        parsed_counts=parsed_counts,
+        packed_counts=packed_counts,
+        total_packed_masks=total_packed_masks,
+        failed_npz_loads=failed_npz_loads,
+        canonical_only=bool(args.canonical_only),
+    )
+
+    print(f"[INFO] Done. Prepacked outputs in: {prepacked_dir}")
 
 
 if __name__ == "__main__":

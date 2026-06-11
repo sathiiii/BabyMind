@@ -1,6 +1,3 @@
 from setuptools import find_packages, setup
 
-setup(
-    name="multimodal",
-    packages=find_packages(),
-)
+setup(name="babymind", packages=find_packages(include=["multimodal", "multimodal.*"]))

@@ -21,7 +21,7 @@ def list_imgs(cat_dir: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--s_multimodal", type=Path, required=True,
-                    help="Root: /misc/.../S_multimodal")
+                    help="Root of local object-category image directory")
     ap.add_argument("--n_foils", type=int, default=3)
     ap.add_argument("--n_repeats", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)

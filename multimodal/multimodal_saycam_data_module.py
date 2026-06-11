@@ -9,6 +9,8 @@ import random
 import re
 import shutil
 import time
+import hashlib
+import argparse
 
 import cv2 as cv
 import imageio
@@ -17,6 +19,11 @@ import numpy as np
 import pandas as pd
 from gsheets import Sheets
 import torch
+from torch.utils.data import get_worker_info
+import spacy
+import clip
+from torchvision import transforms as tvt
+from torchvision.transforms import functional as TF, InterpolationMode
 
 from multimodal.multimodal_data_module import (
     MultiModalDataset,
@@ -37,18 +44,12 @@ from multimodal.multimodal_data_module import (
 )
 from multimodal.utils import *
 
-import spacy
-import clip
-
-from torchvision import transforms as tvt
-from torchvision.transforms import functional as TF, InterpolationMode
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --------------------------------------------------------------------------
 # Directories and filenames
 # --------------------------------------------------------------------------
-DATA_DIR = Path("./expt_saycam")
+DATA_DIR = Path(os.environ.get("BABYMIND_DATA_DIR", "./expt_saycam"))
 GSHEETS_CREDENTIALS_FILENAME = DATA_DIR / "credentials.json"
 TRANSCRIPT_LINKS_FILENAME = DATA_DIR / "converted_SAYCam_transcript_links.csv"
 TRANSCRIPTS_DIRNAME = DATA_DIR / "transcripts"
@@ -61,26 +62,24 @@ EVAL_FRAMES_DIRNAME = DATA_DIR / "eval"
 FILTERED_EVAL_FRAMES_DIRNAME = DATA_DIR / "eval_filtered"
 MANUAL_FILTERED_EVAL_FRAMES_DIRNAME = DATA_DIR / "eval_manual_filtered"
 ANIMATED_FRAMES_DIRNAME = DATA_DIR / "train_animated_5fps"
+
 TRAIN_METADATA_FILENAME = DATA_DIR / "train.json"
 TRAIN_SHUFFLED_METADATA_FILENAME = DATA_DIR / "train_shuffled.json"
 VAL_METADATA_FILENAME = DATA_DIR / "val.json"
 TEST_METADATA_FILENAME = DATA_DIR / "test.json"
+
 EVAL_DEV_METADATA_FILENAME = DATA_DIR / "eval_dev.json"
 EVAL_TEST_METADATA_FILENAME = DATA_DIR / "eval_test.json"
 FILTERED_EVAL_DEV_METADATA_FILENAME = DATA_DIR / "eval_filtered_dev.json"
 FILTERED_EVAL_TEST_METADATA_FILENAME = DATA_DIR / "eval_filtered_test.json"
 MANUAL_FILTERED_EVAL_TEST_METADATA_FILENAME = DATA_DIR / "eval_manual_filtered_test.json"
-# VOCAB_FILENAME = Path("multimodal/vocab.json")  # Use this when evaluating with CVCL HF checkpoints
+
 VOCAB_FILENAME = DATA_DIR / "vocab.json"
 
-# default SAM masks root for training frames (used to locate prepacked index by default)
 TRAIN_SAM_MASKS_DIRNAME = DATA_DIR / "train_sam_masks"
-
-# max number of SAM instances we keep per frame (excess are dropped)
 MAX_SAM_INSTANCES_PER_FRAME = 8
 
 # default arguments
-# dataset arguments
 TRAIN_FRAC = 0.9
 VAL_FRAC = 0.05
 
@@ -91,15 +90,20 @@ MAX_FRAMES_PER_UTTERANCE = 32
 MULTIPLE_FRAMES = False
 SHUFFLE_UTTERANCES = False
 
+BAG_NUM_FRAMES = 1  # new default
+BAG_CONTIGUOUS = False  # NEW
+BAG_SORT_BY_TIME = True  # NEW
+
+
+def _clip_to_uid64(s: str) -> int:
+    h = hashlib.md5(s.encode("utf-8")).digest()
+    return int.from_bytes(h[:8], byteorder="little", signed=False)
+
 
 class JointImageMaskTransform:
     """
-    Jointly apply the same random geometric transforms to an image and a stack
-    of binary masks with shape (K, 1, H, W).
-
-    Parameters are derived from the image side (RandomResizedCrop,
-    RandomHorizontalFlip) so that image behavior is unchanged and masks stay
-    aligned.
+    Jointly apply the same random geometric transforms to an image and
+    a stack of binary masks with shape (K, 1, H, W).
     """
 
     def __init__(
@@ -115,17 +119,8 @@ class JointImageMaskTransform:
         self.hflip_prob = hflip_prob
 
     def __call__(self, img: Image.Image, masks: torch.Tensor | None):
-        """
-        img:   PIL Image (H, W, 3)
-        masks: torch.Tensor of shape (K, 1, H, W) in [0, 1] or None
-        """
-        # random resized crop if requested
         if self.scale != (1.0, 1.0) or self.ratio != (1.0, 1.0):
-            i, j, h, w = tvt.RandomResizedCrop.get_params(
-                img,
-                scale=self.scale,
-                ratio=self.ratio,
-            )
+            i, j, h, w = tvt.RandomResizedCrop.get_params(img, scale=self.scale, ratio=self.ratio)
             img = TF.resized_crop(
                 img,
                 top=i,
@@ -135,12 +130,11 @@ class JointImageMaskTransform:
                 size=self.size,
                 interpolation=InterpolationMode.BILINEAR,
             )
-
             if masks is not None and masks.numel() > 0:
                 k, _, _, _ = masks.shape
                 masks_out = []
                 for idx in range(k):
-                    m = masks[idx]  # (1, H, W)
+                    m = masks[idx]
                     m = TF.resized_crop(
                         m,
                         top=i,
@@ -153,7 +147,6 @@ class JointImageMaskTransform:
                     masks_out.append(m)
                 masks = torch.stack(masks_out, dim=0)
 
-        # random horizontal flip (IMPORTANT: use torch RNG, not python random)
         if self.hflip_prob > 0.0 and torch.rand(()) < self.hflip_prob:
             img = TF.hflip(img)
             if masks is not None and masks.numel() > 0:
@@ -164,19 +157,14 @@ class JointImageMaskTransform:
 
 class MultiModalSAYCamDataset(MultiModalDataset):
     """
-    Dataset that returns paired image utterances from baby S of the SAYCam dataset.
-
-    When use_sam_masks is True, it queries the prepacked SAM index owned by the
-    MultiModalDataset base class (SamPrepackedIndex) and attaches mask metadata to
-    each sample.
-
-    meta["sam_mask"]            : FloatTensor (K, 1, H, W), K <= max_sam_instances_per_frame
-    meta["sam_mask_concept_id"] : LongTensor (K,)
-    meta["sam_mask_count"]      : LongTensor scalar, number of real masks before padding
-    meta["vm_concept_id"]       : alias of sam_mask_concept_id
+    Returns:
+      - img: (3,H,W) if bag_num_frames==1 else (M,3,H,W)
+      - utterance_idxs: (T,)
+      - utterance_length: int
+      - raw_utterance: [str]
+      - meta: dict with optional SAM fields.
     """
 
-    # Robust parsing: treat the final _<utt:03>_<frm:02> as the temporal suffix.
     _TAIL_RE = re.compile(r"^(?P<clip>.+)_(?P<utt>\d{3})_(?P<frm>\d{2})$")
 
     def __init__(
@@ -188,31 +176,45 @@ class MultiModalSAYCamDataset(MultiModalDataset):
         use_sam_masks: bool = False,
         sam_prepacked_dir: str | None = None,
         sam_frames_root: str | None = None,
-        concept2idx: dict[str, int] | None = None,
         max_sam_instances_per_frame: int = MAX_SAM_INSTANCES_PER_FRAME,
         sam_cache_size: int = 0,
+        bag_num_frames: int = 1,
+        bag_contiguous: bool = BAG_CONTIGUOUS,
+        bag_sort_by_time: bool = BAG_SORT_BY_TIME,
+        sam_verbose_stats: bool = False,
+        sam_cid_remap: torch.Tensor | None = None,
+        sam_dropped_concepts: dict[str, str] | None = None,
     ):
-        # Initialize the base class with prepacked index configuration
         super().__init__(
             sam_prepacked_dir=sam_prepacked_dir if use_sam_masks else None,
             sam_frames_root=sam_frames_root if use_sam_masks else None,
-            sam_concept2idx=concept2idx if use_sam_masks else None,
-            sam_cache_size=sam_cache_size if use_sam_masks else 0,
-        )
 
+            # IMPORTANT: when remap is provided, SamPrepackedIndex.load will use it
+            sam_cid_remap=sam_cid_remap,
+            sam_dropped_concepts=sam_dropped_concepts,
+
+            # These should stay disabled to avoid double filtering
+            sam_concept2idx=None,
+            sam_min_masks_per_concept=0,
+            sam_concept_frequency_json=None,
+
+            sam_cache_size=sam_cache_size if use_sam_masks else 0,
+            sam_verbose_stats=sam_verbose_stats,
+        )
         self.data = data
         self.vocab = vocab
         self.multiple_frames = multiple_frames
         self.transform = transform
         self.use_sam_masks = bool(use_sam_masks)
         self.max_sam_instances = int(max_sam_instances_per_frame)
-        self.concept2idx = concept2idx
+        self.bag_num_frames = int(bag_num_frames)
+        self.bag_contiguous = bool(bag_contiguous)
+        self.bag_sort_by_time = bool(bag_sort_by_time)
 
-        # this will be installed by the data module for the training split
+        self._mask_rng = None
         self.joint_img_mask_transform: JointImageMaskTransform | None = None
 
     def __len__(self) -> int:
-        """Returns the length of the dataset."""
         return len(self.data)
 
     @staticmethod
@@ -227,17 +229,16 @@ class MultiModalSAYCamDataset(MultiModalDataset):
         except Exception:
             return None
 
-    def _parse_temporal_from_relname(
-        self, rel_name: str, example: dict[str, Any]
-    ) -> tuple[str, int, int]:
-        """
-        Parse:
-          clip_id   = everything before _<utt:03>_<frm:02>
-          utt_idx   = int(utt)
-          frm_local = int(frm)
+    def _get_mask_rng(self) -> torch.Generator:
+        if self._mask_rng is None:
+            wi = get_worker_info()
+            base_seed = wi.seed if wi is not None else torch.initial_seed()
+            g = torch.Generator()
+            g.manual_seed((base_seed + 1337) % (2**63 - 1))
+            self._mask_rng = g
+        return self._mask_rng
 
-        If parsing fails, fall back to metadata-based clip ids and zeros.
-        """
+    def _parse_temporal_from_relname(self, rel_name: str, example: dict[str, Any]) -> tuple[str, int, int]:
         stem = Path(rel_name).stem
         m = self._TAIL_RE.match(stem)
         if m is not None:
@@ -246,7 +247,6 @@ class MultiModalSAYCamDataset(MultiModalDataset):
             frm_local = int(m.group("frm"))
             return clip_id, utt_idx, frm_local
 
-        # fallback: use metadata fields so clip_id stays stable
         vid = example.get("video_filename", None)
         trn = example.get("transcript_filename", None)
         if isinstance(vid, str) and len(vid) > 0:
@@ -255,7 +255,6 @@ class MultiModalSAYCamDataset(MultiModalDataset):
             clip_id = Path(trn).stem
         else:
             clip_id = stem
-
         return clip_id, 0, 0
 
     def _frame_idx_from_timestamps(
@@ -265,42 +264,23 @@ class MultiModalSAYCamDataset(MultiModalDataset):
         utt_idx: int,
         fps: float = 5.0,
     ) -> tuple[int, float | None]:
-        """
-        Prefer timestamps[frm_local], not frame_filenames.index(rel_name).
-        This remains correct even if some frame files were removed from
-        frame_filenames but timestamps still contains entries for them.
-        """
         ts_sec: float | None = None
-
         if isinstance(timestamps, (list, tuple)) and frm_local < len(timestamps):
             ts_sec = self._safe_float(timestamps[frm_local])
-
         if ts_sec is not None:
-            # floor matches extraction behavior better than round
             frame_idx = int(np.floor(ts_sec * fps + 1e-6))
             return frame_idx, ts_sec
-
-        # fallback: deterministic monotonic index within utterance
         frame_idx = int(utt_idx) * 1000 + int(frm_local)
         return frame_idx, None
 
-    def __getitem__(self, idx: int):
-        # --- text ---
-        utterance = self.data[idx]["utterance"]
-        utterance_words = [SOS_TOKEN] + utterance.split() + [EOS_TOKEN]
-        utterance_length = len(utterance_words)
-        utterance_idxs = torch.tensor(
-            [self.vocab.get(w, UNK_TOKEN_ID) for w in utterance_words],
-            dtype=torch.long,
-        )
-
-        # --- image selection ---
-        img_filenames = self.data[idx]["frame_filenames"]
-        rel_name = random.choice(img_filenames) if self.multiple_frames else img_filenames[0]
-        img_path = Path(EXTRACTED_FRAMES_DIRNAME, rel_name)
-        img = Image.open(img_path).convert("RGB")
-
-        # --- optional SAM object masks from prepacked index (before any augmentation) ---
+    def _load_and_pad_sam(self, img_path: Path) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        Returns:
+          sam_mask: (Kmax,1,H,W) float32
+          sam_cid:  (Kmax,) long (padded with -1)
+          sam_count: int (real count)
+        """
+        Kmax = int(self.max_sam_instances)
         sam_mask = None
         sam_mask_concept_id = None
         sam_mask_count = 0
@@ -312,177 +292,237 @@ class MultiModalSAYCamDataset(MultiModalDataset):
                 sam_mask_concept_id = sam_meta["sam_mask_concept_id"]  # (K,)
                 sam_mask_count = int(sam_meta["sam_mask_count"].item())
 
-                # randomly cap number of instances per frame if requested
-                if sam_mask.shape[0] > self.max_sam_instances > 0:
+                if sam_mask.shape[0] > Kmax > 0:
                     K = sam_mask.shape[0]
-                    Kmax = self.max_sam_instances
-                    idxs = torch.randperm(K)[:Kmax]
+                    idxs = torch.randperm(K, generator=self._get_mask_rng())[:Kmax]
                     sam_mask = sam_mask[idxs]
                     sam_mask_concept_id = sam_mask_concept_id[idxs]
                     sam_mask_count = min(sam_mask_count, Kmax)
 
-        # If still no masks but we are in SAM mode, create sentinel mask so that
-        # downstream code always sees a sam_mask tensor, with count = 0.
-        if self.use_sam_masks and (sam_mask is None or sam_mask.numel() == 0):
-            sam_mask = torch.zeros(1, 1, IMAGE_H, IMAGE_W, dtype=torch.float32)
-            sam_mask_concept_id = torch.full((1,), -1, dtype=torch.long)
+        if sam_mask is None or sam_mask.numel() == 0:
+            sam_mask = torch.zeros(Kmax, 1, IMAGE_H, IMAGE_W, dtype=torch.float32)
+            sam_mask_concept_id = torch.full((Kmax,), -1, dtype=torch.long)
             sam_mask_count = 0
-
-        # --- joint image and mask geometric transforms (train only) ---
-        if self.joint_img_mask_transform is not None:
-            img, sam_mask = self.joint_img_mask_transform(img, sam_mask)
-
-        # --- image only transforms (color etc, tensor conversion, normalization) ---
-        if self.transform is not None:
-            img = self.transform(img)
-
-        # --- temporal meta (FIXED) ---
-        clip_id, utt_idx, frm_local = self._parse_temporal_from_relname(
-            rel_name, self.data[idx]
-        )
-
-        timestamps = self.data[idx].get("timestamps", None)
-        frame_idx, ts_sec = self._frame_idx_from_timestamps(
-            timestamps=timestamps,
-            frm_local=frm_local,
-            utt_idx=utt_idx,
-            fps=5.0,
-        )
-
-        meta: dict[str, Any] = {
-            "clip_id": clip_id,
-            "frame_idx": frame_idx,
-            "frame_filename": rel_name,
-            # extra fields are harmless and helpful for debugging
-            "utt_idx": utt_idx,
-            "frm_local": frm_local,
-        }
-        if ts_sec is not None:
-            meta["timestamp_sec"] = ts_sec
-
-        # --- SAM metadata after transforms ---
-        if self.use_sam_masks and sam_mask is not None:
-            meta["sam_mask"] = sam_mask  # (K, 1, H, W)
-
-            if sam_mask_concept_id is None:
-                sam_mask_concept_id = torch.full(
-                    (sam_mask.shape[0],),
-                    -1,
-                    dtype=torch.long,
+        else:
+            K = sam_mask.shape[0]
+            if K < Kmax:
+                pad_k = Kmax - K
+                H, W = sam_mask.shape[-2], sam_mask.shape[-1]
+                sam_mask = torch.cat(
+                    [sam_mask, torch.zeros(pad_k, 1, H, W, dtype=sam_mask.dtype)],
+                    dim=0,
+                )
+                sam_mask_concept_id = torch.cat(
+                    [sam_mask_concept_id, torch.full((pad_k,), -1, dtype=sam_mask_concept_id.dtype)],
+                    dim=0,
                 )
 
-            meta["sam_mask_concept_id"] = sam_mask_concept_id  # (K,)
-            meta["sam_mask_count"] = torch.tensor(
-                sam_mask_count,
-                dtype=torch.long,
-            )
-            # alias used by visual memory code for a generic key
-            meta["vm_concept_id"] = sam_mask_concept_id  # (K,)
+        return sam_mask, sam_mask_concept_id, int(sam_mask_count)
 
-        return img, utterance_idxs, utterance_length, [utterance], meta
+    def __getitem__(self, idx: int):
+        example = self.data[idx]
+
+        # --- text ---
+        utterance = example["utterance"]
+        utterance_words = [SOS_TOKEN] + utterance.split() + [EOS_TOKEN]
+        utterance_length = len(utterance_words)
+        utterance_idxs = torch.tensor(
+            [self.vocab.get(w, UNK_TOKEN_ID) for w in utterance_words],
+            dtype=torch.long,
+        )
+
+        # --- frame selection (single or bag) ---
+        img_filenames = example["frame_filenames"]
+        M = int(self.bag_num_frames)
+
+        if M <= 1:
+            if self.multiple_frames and len(img_filenames) > 1:
+                rel_name = img_filenames[int(torch.randint(0, len(img_filenames), (1,)).item())]
+            else:
+                rel_name = img_filenames[0]
+
+            img_path = Path(EXTRACTED_FRAMES_DIRNAME, rel_name)
+            img = Image.open(img_path).convert("RGB")
+
+            sam_mask, sam_cid, sam_count = self._load_and_pad_sam(img_path) if self.use_sam_masks else (None, None, 0)
+
+            if self.joint_img_mask_transform is not None and sam_mask is not None:
+                img, sam_mask = self.joint_img_mask_transform(img, sam_mask)
+
+            if self.transform is not None:
+                img = self.transform(img)
+
+            clip_id, utt_idx, frm_local = self._parse_temporal_from_relname(rel_name, example)
+            clip_uid = _clip_to_uid64(clip_id)
+            timestamps = example.get("timestamps", None)
+            frame_idx, ts_sec = self._frame_idx_from_timestamps(timestamps, frm_local, utt_idx, fps=5.0)
+
+            meta: dict[str, Any] = {
+                "clip_id": clip_id,
+                "clip_uid": clip_uid,
+                "frame_idx": frame_idx,
+                "frame_filename": rel_name,
+                "utt_idx": utt_idx,
+                "frm_local": frm_local,
+            }
+            if ts_sec is not None:
+                meta["timestamp_sec"] = ts_sec
+
+            if self.use_sam_masks and sam_mask is not None:
+                meta["sam_mask"] = sam_mask
+                meta["sam_mask_concept_id"] = sam_cid if sam_cid is not None else torch.full((sam_mask.shape[0],), -1, dtype=torch.long)
+                meta["sam_mask_count"] = torch.tensor(sam_count, dtype=torch.long)
+                meta["vm_concept_id"] = meta["sam_mask_concept_id"]
+
+            return img, utterance_idxs, utterance_length, [utterance], meta
+
+        # -------------------------
+        # Bagged frames (M > 1)
+        # -------------------------
+        n_frames = len(img_filenames)
+        if n_frames <= 0:
+            raise ValueError("Example has no frame_filenames")
+
+        # choose indices
+        if n_frames >= M:
+            if self.bag_contiguous:
+                start_max = n_frames - M
+                start = int(torch.randint(0, start_max + 1, (1,)).item()) if start_max > 0 else 0
+                chosen = list(range(start, start + M))
+            else:
+                chosen = torch.randperm(n_frames)[:M].tolist()
+        else:
+            chosen = torch.randint(0, n_frames, (M,)).tolist()
+
+        # build sortable items with temporal indices first
+        items = []
+        timestamps = example.get("timestamps", None)
+
+        clip_id_final = None
+        utt_idx_final = 0
+        clip_uid_final = 0
+
+        for j in chosen:
+            rel_name = img_filenames[int(j)]
+            clip_id, utt_idx, frm_local = self._parse_temporal_from_relname(rel_name, example)
+            frame_idx, ts_sec = self._frame_idx_from_timestamps(timestamps, frm_local, utt_idx, fps=5.0)
+
+            if clip_id_final is None:
+                clip_id_final = clip_id
+                utt_idx_final = int(utt_idx)
+                clip_uid_final = _clip_to_uid64(clip_id_final)
+
+            items.append(
+                {
+                    "rel_name": rel_name,
+                    "clip_id": clip_id,
+                    "utt_idx": int(utt_idx),
+                    "frm_local": int(frm_local),
+                    "frame_idx": int(frame_idx),
+                    "timestamp_sec": float(ts_sec) if ts_sec is not None else float("nan"),
+                }
+            )
+
+        if self.bag_sort_by_time:
+            items.sort(key=lambda d: d["frame_idx"])
+
+        imgs, masks, cids, counts = [], [], [], []
+        frame_idxs, rel_names, frm_locals, ts_list = [], [], [], []
+
+        for it in items:
+            rel_name = it["rel_name"]
+            rel_names.append(rel_name)
+            frame_idxs.append(it["frame_idx"])
+            frm_locals.append(it["frm_local"])
+            ts_list.append(it["timestamp_sec"])
+
+            img_path = Path(EXTRACTED_FRAMES_DIRNAME, rel_name)
+            img = Image.open(img_path).convert("RGB")
+
+            sam_mask, sam_cid, sam_count = self._load_and_pad_sam(img_path) if self.use_sam_masks else (None, None, 0)
+
+            if self.joint_img_mask_transform is not None and sam_mask is not None:
+                img, sam_mask = self.joint_img_mask_transform(img, sam_mask)
+
+            if self.transform is not None:
+                img = self.transform(img)
+
+            imgs.append(img)
+
+            if self.use_sam_masks and sam_mask is not None:
+                masks.append(sam_mask)
+                cids.append(
+                    sam_cid if sam_cid is not None else torch.full((sam_mask.shape[0],), -1, dtype=torch.long)
+                )
+                counts.append(int(sam_count))
+
+        img_tensor = torch.stack(imgs, dim=0)  # (M,3,H,W)
+
+        meta: dict[str, Any] = {
+            "clip_id": clip_id_final if clip_id_final is not None else "",
+            "clip_uid": int(clip_uid_final),
+            "utt_idx": int(utt_idx_final),
+            "frame_idx": torch.tensor(frame_idxs, dtype=torch.long),  # (M,)
+            "frm_local": torch.tensor(frm_locals, dtype=torch.long),  # (M,)
+            "timestamp_sec": torch.tensor(ts_list, dtype=torch.float32),  # (M,)
+            "frame_filename": list(rel_names),  # (M,)
+        }
+
+        if self.use_sam_masks and len(masks) > 0:
+            meta["sam_mask"] = torch.stack(masks, dim=0)  # (M,K,1,H,W)
+            meta["sam_mask_concept_id"] = torch.stack(cids, dim=0)  # (M,K)
+            meta["sam_mask_count"] = torch.tensor(counts, dtype=torch.long)  # (M,)
+            meta["vm_concept_id"] = meta["sam_mask_concept_id"]
+
+        return img_tensor, utterance_idxs, utterance_length, [utterance], meta
 
 
 class MultiModalSAYCamDataModule(MultiModalDataModule):
     """
-    A data module created from baby S of the SAYCam dataset consisting of
-    image frames and the associated child directed utterances.
-
-    It integrates the prepacked SAM index support provided by MultiModalDataset
-    (SamPrepackedIndex) and optionally restricts concepts using a concept list
-    file during index loading.
+    Adds:
+      --use_sam_masks
+      --bag_num_frames  (train only, when SAM is active)
     """
 
     def __init__(self, args=None) -> None:
         super().__init__(args)
-
         self.multiple_frames = self.args.get("multiple_frames", MULTIPLE_FRAMES)
         self.shuffle_utterances = self.args.get("shuffle_utterances", SHUFFLE_UTTERANCES)
 
-        # SAM related flags
         self.use_sam_masks = bool(self.args.get("use_sam_masks", False))
+        # If MIL wants saliency/none masks, do not load SAM in the dataset even if --use_sam_masks was passed.
+        self.mil_mask_source = str(self.args.get("mil_mask_source", "sam")).lower()
+        if self.mil_mask_source != "sam":
+            self.use_sam_masks = False
+        self.bag_num_frames = int(self.args.get("bag_num_frames", BAG_NUM_FRAMES))
+        self.bag_contiguous = bool(self.args.get("bag_contiguous", False))
+        self.bag_sort_by_time = bool(self.args.get("bag_sort_by_time", True))
 
-        # be robust if the base class does not define these
         if not hasattr(self, "sam_prepacked_dir"):
             self.sam_prepacked_dir = self.args.get("sam_prepacked_dir", None)
         if not hasattr(self, "sam_frames_root"):
             self.sam_frames_root = self.args.get("sam_frames_root", None)
 
-        # Where raw SAM artifacts and prepacked index live. This root is mainly
-        # kept so that defaults for sam_prepacked_dir can be derived.
         sam_dir_arg = self.args.get("sam_masks_dir", str(TRAIN_SAM_MASKS_DIRNAME))
         self.sam_masks_dir = Path(sam_dir_arg) if sam_dir_arg is not None else None
 
-        # How many SAM instances per frame to expose to the model
         self.max_sam_instances_per_frame = int(
             self.args.get("max_sam_instances_per_frame", MAX_SAM_INSTANCES_PER_FRAME)
         )
 
-        # Optional concept list for SAM / visual memory integration
-        self.concept2idx: dict[str, int] | None = None
-        concept_list_path = self.args.get("concept_list_file", None)
-        if concept_list_path is not None:
-            p = Path(concept_list_path)
-            if p.is_file():
-                try:
-                    with open(p, "r") as f:
-                        raw = json.load(f)
-                except Exception as e:
-                    print(
-                        "[MultiModalSAYCamDataModule] Failed to load concept list "
-                        f"from {p}: {e}"
-                    )
-                else:
-                    mapping: dict[str, int] | None = None
-                    if isinstance(raw, dict):
-                        # if values are ints, assume mapping directly
-                        if all(isinstance(v, int) for v in raw.values()):
-                            mapping = {str(k).lower(): int(v) for k, v in raw.items()}
-                        else:
-                            names = list(raw.keys())
-                            mapping = {str(name).lower(): i for i, name in enumerate(names)}
-                    elif isinstance(raw, list):
-                        mapping = {str(name).lower(): i for i, name in enumerate(raw)}
-
-                    if mapping is not None:
-                        self.concept2idx = mapping
-                        print(
-                            f"[MultiModalSAYCamDataModule] Loaded "
-                            f"{len(self.concept2idx)} concepts from {p}"
-                        )
-                    else:
-                        print(
-                            "[MultiModalSAYCamDataModule] Unsupported concept list "
-                            f"format in {p}, ignoring."
-                        )
-            else:
-                print(
-                    "[MultiModalSAYCamDataModule] concept_list_file "
-                    f"{p} does not exist, ignoring."
-                )
-
-        # Cache size for prepacked SAM mask .pt files (per dataset instance)
         self.sam_prepacked_cache_size = int(self.args.get("sam_prepacked_cache_size", 0))
 
-        # Override default sam_frames_root if user did not specify one.
-        # For SAYCam we want frame_relpath keys relative to EXTRACTED_FRAMES_DIRNAME.
         if self.args.get("sam_frames_root", None) is None:
             self.sam_frames_root = str(EXTRACTED_FRAMES_DIRNAME)
-
-        # If sam_prepacked_dir was not set explicitly, derive it from sam_masks_dir
         if (self.args.get("sam_prepacked_dir", None) is None) and (self.sam_masks_dir is not None):
             self.sam_prepacked_dir = str(self.sam_masks_dir / "sam_prepacked")
 
-        # --------------------------------------------------------------
-        # Build joint image mask transform for training (SAM-only)
-        # --------------------------------------------------------------
         self.joint_img_mask_transform_train: JointImageMaskTransform | None = None
-
         if self.use_sam_masks:
 
             def _split_geom_and_other(tfm):
                 if not isinstance(tfm, tvt.Compose):
                     return None, tfm
-
                 geom = []
                 other = []
                 for t in tfm.transforms:
@@ -504,7 +544,6 @@ class MultiModalSAYCamDataModule(MultiModalDataModule):
 
             geom_tfms, non_geom_tfms = _split_geom_and_other(self.transform)
             if geom_tfms:
-                # derive parameters from RandomResizedCrop and RandomHorizontalFlip if present
                 rrc = None
                 hflip = None
                 for t in geom_tfms:
@@ -526,70 +565,33 @@ class MultiModalSAYCamDataModule(MultiModalDataModule):
                     ratio=ratio,
                     hflip_prob=hflip_prob,
                 )
-
-                # keep only the non geometric transforms on the image side
                 self.transform = non_geom_tfms
 
     @staticmethod
     def add_additional_to_argparse(parser):
-        parser.add_argument(
-            "--multiple_frames",
-            action="store_true",
-            help="Randomly sample frames per utterance.",
-        )
-        parser.add_argument(
-            "--shuffle_utterances",
-            action="store_true",
-            help=(
-                "Use shuffled utterances during training rather than "
-                "matched utterances"
-            ),
-        )
-        parser.add_argument(
-            "--use_sam_masks",
-            action="store_true",
-            help=(
-                "Attach per-object SAM masks for SAYCam training frames in "
-                "batch_meta['sam_mask'] as a padded stack, with concept ids in "
-                "batch_meta['sam_mask_concept_id'] loaded from the prepacked index."
-            ),
-        )
-        parser.add_argument(
-            "--sam_masks_dir",
-            type=str,
-            default=str(TRAIN_SAM_MASKS_DIRNAME),
-            help=(
-                "Root directory containing SAM artifacts for training frames. "
-                "By default, prepacked masks are expected in sam_masks_dir/sam_prepacked."
-            ),
-        )
-        parser.add_argument(
-            "--max_sam_instances_per_frame",
-            type=int,
-            default=MAX_SAM_INSTANCES_PER_FRAME,
-            help=(
-                "Maximum number of SAM object instances to attach per frame. "
-                "If more masks exist for a frame in the prepacked index, this many "
-                "are randomly sampled on each access."
-            ),
-        )
-        parser.add_argument(
-            "--sam_prepacked_cache_size",
-            type=int,
-            default=0,
-            help=(
-                "Approximate number of prepacked .pt files to cache per "
-                "dataset instance for SAM masks. Set to 0 to disable caching."
-            ),
-        )
+        parser.add_argument("--multiple_frames", action="store_true")
+        parser.add_argument("--shuffle_utterances", action="store_true")
+
+        parser.add_argument("--use_sam_masks", action="store_true")
+        parser.add_argument("--sam_masks_dir", type=str, default=str(TRAIN_SAM_MASKS_DIRNAME))
+        parser.add_argument("--max_sam_instances_per_frame", type=int, default=MAX_SAM_INSTANCES_PER_FRAME)
+        parser.add_argument("--sam_prepacked_cache_size", type=int, default=0)
+        parser.add_argument("--sam_min_masks_per_concept", type=int, default=10)
+        parser.add_argument("--sam_concept_frequency_json", type=str, default='expt_saycam/train_sam_masks/sam_prepacked/concept_frequency.json')
+        parser.add_argument("--sam_verbose_stats", action="store_true")
+
+        # NEW: how many frames per utterance to return (train split only when SAM is on)
+        parser.add_argument("--bag_num_frames", type=int, default=BAG_NUM_FRAMES)
+        parser.add_argument("--bag_contiguous", action="store_true")
+        parser.add_argument("--bag_sort_by_time", action="store_true")
+        parser.add_argument("--bag_no_sort_by_time", dest="bag_sort_by_time", action="store_false", help=argparse.SUPPRESS)
+        parser.set_defaults(bag_sort_by_time=True)
+
         return parser
 
     @staticmethod
     def add_to_argparse(parser):
-        parser = super(
-            MultiModalSAYCamDataModule,
-            MultiModalSAYCamDataModule,
-        ).add_to_argparse(parser)
+        parser = super(MultiModalSAYCamDataModule, MultiModalSAYCamDataModule).add_to_argparse(parser)
         parser = MultiModalSAYCamDataModule.add_additional_to_argparse(parser)
         return parser
 
@@ -610,7 +612,6 @@ class MultiModalSAYCamDataModule(MultiModalDataModule):
         _create_extra_eval_metadata()
         _create_extra_filtered_eval_metadata()
         _create_vocab()
-        # _create_animations()  # optional
 
     def read_vocab(self):
         return read_vocab(VOCAB_FILENAME)
@@ -622,12 +623,7 @@ class MultiModalSAYCamDataModule(MultiModalDataModule):
             # use shuffled training data
             print("Training using shuffled utterances!")
             stage_splits = [
-                (
-                    "train",
-                    TRAIN_SHUFFLED_METADATA_FILENAME,
-                    self.multiple_frames,
-                    self.transform,
-                ),
+                ("train", TRAIN_SHUFFLED_METADATA_FILENAME, self.multiple_frames, self.transform),
                 ("val", VAL_METADATA_FILENAME, False, self.base_transform),
                 ("test", TEST_METADATA_FILENAME, False, self.base_transform),
             ]
@@ -635,21 +631,24 @@ class MultiModalSAYCamDataModule(MultiModalDataModule):
             # use matched training data
             print("Training using matched utterances!")
             stage_splits = [
-                (
-                    "train",
-                    TRAIN_METADATA_FILENAME,
-                    self.multiple_frames,
-                    self.transform,
-                ),
+                ("train", TRAIN_METADATA_FILENAME, self.multiple_frames, self.transform),
                 ("val", VAL_METADATA_FILENAME, False, self.base_transform),
                 ("test", TEST_METADATA_FILENAME, False, self.base_transform),
             ]
 
+        reg = getattr(self, "sam_registry", None)
+
         for split, filename, multiple_frames, transform in stage_splits:
             data = load_data(filename)
 
-            # use SAM masks only for training by default
             use_sam = self.use_sam_masks if split == "train" else False
+            bag_num_frames = self.bag_num_frames if (split == "train") else 1
+
+            sam_cid_remap = None
+            sam_dropped = None
+            if split == "train" and use_sam and reg is not None:
+                sam_cid_remap = reg.local_to_global
+                sam_dropped = reg.dropped_local
 
             dataset = MultiModalSAYCamDataset(
                 data=data,
@@ -659,24 +658,32 @@ class MultiModalSAYCamDataModule(MultiModalDataModule):
                 use_sam_masks=use_sam,
                 sam_prepacked_dir=self.sam_prepacked_dir if use_sam else None,
                 sam_frames_root=self.sam_frames_root if use_sam else None,
-                concept2idx=self.concept2idx if use_sam else None,
+                sam_cid_remap=sam_cid_remap,
+                sam_dropped_concepts=sam_dropped,
                 max_sam_instances_per_frame=self.max_sam_instances_per_frame,
                 sam_cache_size=self.sam_prepacked_cache_size if use_sam else 0,
+                bag_num_frames=bag_num_frames,
+                bag_contiguous=self.bag_contiguous,
+                bag_sort_by_time=self.bag_sort_by_time,
+                sam_verbose_stats=bool(self.args.get("sam_verbose_stats", False)),
             )
 
-            # install joint image+mask transform ONLY when SAM is active for this split
             if split == "train" and use_sam and self.joint_img_mask_transform_train is not None:
                 dataset.joint_img_mask_transform = self.joint_img_mask_transform_train
 
             datasets[split] = dataset
+            print(f"=== Loaded {split} dataset with {len(dataset)} samples. ===")
 
         return datasets
 
 
-def _download_transcripts():
-    """Download SAYCam transcripts."""
+# ---------------------------------------------------------------------------------
+# The rest of the file (data preparation / eval prep) remains unchanged below.
+# ---------------------------------------------------------------------------------
+# (No changes made to the preprocessing helpers.)
+# ---------------------------------------------------------------------------------
 
-    # check if transcripts have already been downloaded
+def _download_transcripts():
     if os.path.exists(TRANSCRIPTS_DIRNAME):
         print("SAYCam transcripts have already been downloaded. Skipping this step.")
     else:
@@ -707,11 +714,9 @@ def _download_transcripts():
                     df = s.sheets[j].to_frame()
                     # get filename of dataframe
                     filename = f"{TRANSCRIPTS_DIRNAME}/{title}_{s.sheets[j].title}.csv"
-                    df.to_csv(filename, index=False)  # save as CSV
+                    df.to_csv(filename, index=False)
                 except pd.errors.ParserError:
-                    continue  # move onto the next file
-
-            # sleep for 30 seconds to prevent rate limiting
+                    continue
             time.sleep(30)
 
 
@@ -740,7 +745,6 @@ def _rename_transcripts():
             TRANSCRIPTS_DIRNAME / "S_20141029_2412_part 6.csv",
             TRANSCRIPTS_DIRNAME / "S_20141029_2412_06.csv",
         )
-
     if os.path.exists(TRANSCRIPTS_DIRNAME / "S_20141122_2505_part 1.csv"):
         print("Renaming transcripts")
         os.rename(
@@ -1083,6 +1087,7 @@ def _filter_eval_frames():
         for eval_category in eval_categories:
             os.makedirs(Path(FILTERED_LABELED_S_DIRNAME) / eval_category, exist_ok=True)
 
+        # load CLIP model
         model, preprocess = clip.load("ViT-B/16", device=device)
         model.eval()
 
@@ -1091,6 +1096,7 @@ def _filter_eval_frames():
         text_features /= text_features.norm(dim=-1, keepdim=True)
 
         for i, eval_category in enumerate(eval_categories):
+            # get frames for each evaluation category
             eval_category_dir = os.path.join(LABELED_S_DIRNAME, eval_category)
             frames = glob.glob(f"{eval_category_dir}/*.jpeg")
             print(f"Filtering {len(frames)} from the category: {eval_category}")
@@ -1104,6 +1110,7 @@ def _filter_eval_frames():
                 logits_per_text = (100.0 * image_features @ text_features.T).softmax(dim=-1)
                 pred = torch.argmax(logits_per_text, dim=-1).item()
 
+                # copy over image frame if prediction is correct
                 if pred == eval_categories.index(eval_category):
                     frame_filename = frame.split("/")[-1]
                     print(f"Copying {frame_filename} to filtered set")

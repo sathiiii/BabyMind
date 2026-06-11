@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 from collections import Counter
 import random
+import os
 
 from PIL import Image
 from torchvision import transforms
@@ -15,7 +16,7 @@ from multimodal.multimodal_data_module import MultiModalDataset, \
     IMAGE_H, IMAGE_W
 
 # directories and filenames
-DATA_DIR = Path("/misc/vlgscratch5/LakeGroup/shared_data/coco")
+DATA_DIR = Path(os.environ.get("COCO_DATA_DIR", "./data/coco"))
 ANNOTATIONS_DATA_DIR = DATA_DIR / "annotations"
 RAW_TRAIN_DATA_FILENAME = ANNOTATIONS_DATA_DIR / "captions_train2017.json"
 RAW_VAL_DATA_FILENAME = ANNOTATIONS_DATA_DIR / "captions_val2017.json"

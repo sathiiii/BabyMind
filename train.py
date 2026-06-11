@@ -3,11 +3,13 @@ import argparse
 from pathlib import Path
 
 import os
+import sys
 import numpy as np
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.strategies import DDPStrategy
 from torchinfo import summary
 
 from multimodal.multimodal_data_module import MultiModalDataModule
@@ -18,9 +20,22 @@ from multimodal.multimodal_lit import MultiModalLitModel
 from grad_norm_logger import GradNormLogger
 
 # To make sure the results are reproducible for the VM
-env = os.environ.copy()
-env["PYTHONHASHSEED"] = "0"
+os.environ["PYTHONHASHSEED"] = "0"
 
+def redirect_stdout_to_file(log_dir: Path, filename_prefix: str = "stdout") -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # DDP-safe: one file per process
+    rank = int(os.environ.get("RANK", "0"))
+    log_path = log_dir / f"{filename_prefix}_rank{rank}.log"
+
+    f = open(log_path, "a", buffering=1)  # line-buffered
+    sys.stdout = f
+    sys.stderr = f
+
+    # Optional: make prints flush immediately
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    print(f"[logging] Redirected stdout/stderr to: {log_path}", flush=True)
 
 def _setup_parser():
     """Set up Python's ArgumentParser with data, model, trainer, and other arguments."""
@@ -66,31 +81,14 @@ def _inspect_ckpt_compat(model: torch.nn.Module, ckpt_path: Path):
     ckpt = torch.load(str(ckpt_path), map_location="cpu")
     sd = ckpt.get("state_dict", ckpt)
 
-    model_keys = set(model.state_dict().keys())
-    ckpt_keys = set(sd.keys())
+    IGNORE = {"mask_concept_count", "mask_concept_weight"}  # add others if needed
+
+    model_keys = set(model.state_dict().keys()) - IGNORE
+    ckpt_keys = set(sd.keys()) - IGNORE
 
     unexpected = sorted(list(ckpt_keys - model_keys))
     missing = sorted(list(model_keys - ckpt_keys))
     return unexpected, missing
-
-
-def _load_ckpt_nonstrict_drop_prefixes(
-    model: torch.nn.Module,
-    ckpt_path: Path,
-    drop_prefixes=("obj_encoder.",),
-):
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
-    sd = ckpt.get("state_dict", ckpt)
-
-    def _keep(k: str) -> bool:
-        return not any(k.startswith(p) for p in drop_prefixes)
-
-    sd = {k: v for k, v in sd.items() if _keep(k)}
-
-    incompatible = model.load_state_dict(sd, strict=False)
-    print("[ckpt] Loaded with strict=False")
-    print("[ckpt] Missing keys (first 50):", incompatible.missing_keys[:50])
-    print("[ckpt] Unexpected keys (first 50):", incompatible.unexpected_keys[:50])
 
 
 def main():
@@ -104,8 +102,13 @@ def main():
     if str(args.resume_ckpt) == "last":
         args.resume_ckpt = ckpt_dir / "last.ckpt"
 
+    # redirect_stdout_to_file(ckpt_dir, filename_prefix="train")
+
     # Seed
     pl.seed_everything(args.seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
     # Data + models
     DataModuleClass = {
@@ -162,14 +165,6 @@ def main():
             print(unexpected[:10])
             print(f"[ckpt] missing keys: {len(missing)} (showing up to 10)")
             print(missing[:10])
-
-            print("[ckpt] Warm-starting weights (dropping obj_encoder.*) and starting fresh training state.")
-            _load_ckpt_nonstrict_drop_prefixes(
-                lit_model,
-                ckpt_path,
-                drop_prefixes=("obj_encoder.",),
-            )
-            ckpt_path = None  # IMPORTANT: do NOT pass ckpt_path to trainer.fit
 
     # fit model
     trainer.fit(lit_model, data, ckpt_path=ckpt_path)

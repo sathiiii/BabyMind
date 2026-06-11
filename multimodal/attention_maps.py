@@ -170,83 +170,9 @@ def gradCAM(
     return gradcam
 
 
+
 if __name__ == "__main__":
-    from multimodal.multimodal_saycam_data_module import MultiModalSAYCamDataModule
-    from multimodal.coco_captions_data_module import COCOCaptionsDataModule
-    # from multimodal.multimodal import MultiModalModel
-    from multimodal.multimodal_lit import MultiModalLitModel
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-    # load pretrained model
-    model_checkpoint_name = "multimodal_text_encoder_lstm_lr_5e-05_weight_decay_0.1_fix_temperature_True_batch_size_8"
-    model_checkpoint = glob.glob(
-        f"/home/wv9/code/WaiKeen/multimodal-baby/checkpoints/{model_checkpoint_name}/*.ckpt")[0]
-    print(model_checkpoint)
-    model = MultiModalLitModel.load_from_checkpoint(
-        model_checkpoint, map_location=device)
-    model.eval()
-
-    # get data
-    # parse empty args
-    parser = _setup_parser()
-    data_args = parser.parse_args("")
-    # set args
-    for key, value in model.args.items():
-        setattr(data_args, key, value)
-    # make the train dataloader deterministic
-    data_args.augment_frames = False
-
-    # build data module
-    dataset_name = getattr(data_args, "dataset", "saycam")
-    DataModuleClass = {
-        "saycam": MultiModalSAYCamDataModule,
-        "coco": COCOCaptionsDataModule,
-    }[dataset_name]
-    data = DataModuleClass(data_args)
-    data.prepare_data()
-    data.setup()
-
-    vocab = data.read_vocab()
-
-    # dataset
-    eval_dataset = data.eval_datasets["val"]
-
-    # dataloader
-    eval_dataloader = {
-        "dev": data.val_dataloader,
-        "test": data.test_dataloader,
-    }["dev"]()[1]
-
-    imgs, label, label_len, raw_label = eval_dataset[29]
-    label_len = torch.tensor(label_len)
-
-    # display images
-    inv_imgs = imgs.squeeze(0)
-    inv_imgs = n_inv(inv_imgs)
-
-    # determine saliency layer to use
-    saliency_layer = "layer4"
-
-    # get text features
-    text_features = model.model.encode_text(
-        label.unsqueeze(0).to(device), label_len.unsqueeze(0).to(device))[0]
-
-    # create attention map
-    attn_map = gradCAM(
-        model.vision_encoder.model,
-        imgs[0].unsqueeze(0).to(device),
-        text_features,
-        getattr(model.vision_encoder.model, saliency_layer),
-        normalize_features=model.model.normalize_features,
+    raise SystemExit(
+        "attention_maps.py is a library module. Import get_attn_maps/get_gradcam "
+        "from your own analysis script instead of running this file directly."
     )
-    attn_map = attn_map.squeeze().detach().cpu().numpy()
-
-    np_img = inv_imgs[0].permute((1, 2, 0)).cpu().numpy()
-
-    fig, ax = plt.subplots()
-    imshow(ax, getAttMap(np_img, attn_map))
-    # save attention map
-    plt.savefig(filename, bbox_inches='tight')
-    plt.close()

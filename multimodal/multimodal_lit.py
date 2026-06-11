@@ -1,1132 +1,949 @@
+from __future__ import annotations
+
 import argparse
 import functools
 import json
-import numpy as np
 import os
-import torchvision
+import re
+import zlib
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 import spacy
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
-from torchvision import transforms
+import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
-from typing import List, Tuple
 from huggingface_hub import hf_hub_download
+from torchvision import transforms
 
 from multimodal.multimodal import MultiModalModel, LanguageModel, calculate_attn_reg_loss
-from multimodal.utils import get_entropy
 from multimodal.textgen_eval import evaluate as textgen_eval
+from multimodal.utils import get_entropy
 from multimodal.multimodal_data_module import (
-    N_VAL_DATALOADERS_PER_SPLIT, MAX_LEN_UTTERANCE,
-    PAD_TOKEN_ID, SOS_TOKEN_ID, EOS_TOKEN_ID
-)
-from multimodal.nesy_constraints import (
-    build_targets, existential_soft_or_loss, implication_hinge_loss,
-    build_default_rules, build_edge_weights
-)
-from multimodal.visual_memory import (
-    VisualMemory,
-    ObjectAppearanceEncoder,
-    masked_spatial_pool,
-    gaussian_blur2d,
-    make_context_alpha,
-    sample_masks_per_concept_for_viz,
-    overlay_masks_on_images,
+    N_VAL_DATALOADERS_PER_SPLIT,
+    MAX_LEN_UTTERANCE,
+    PAD_TOKEN_ID,
+    SOS_TOKEN_ID,
+    EOS_TOKEN_ID,
+    UNK_TOKEN_ID
 )
 
+from multimodal.object_mil import (
+    l2norm as l2norm_obj,
+    masked_pool_k,
+    context_ring_masks,
+    TrackConfig,
+    build_object_tracks_greedy,
+    pack_candidates_with_null,
+    mil_logsumexp_logits,
+)
+from multimodal.visual_memory import PrototypeMemory
+from multimodal.viz_utils import make_track_grid
+
+# Optional: SAM concept registry for prepacked SAM masks.
 try:
-    import wandb
-except Exception:
+    from multimodal.sam_concept_registry import SamConceptRegistry, build_sam_concept_registry  # type: ignore
+except Exception:  # pragma: no cover
+    SamConceptRegistry = None  # type: ignore
+    build_sam_concept_registry = None  # type: ignore
+
+try:
+    import wandb  # noqa: F401
+except Exception:  # pragma: no cover
     wandb = None
 
 
-# --------------------------------------------------------------------------
-# DDP helpers
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Small utilities
+# -----------------------------------------------------------------------------
 
-class _AllGatherWithGrad(torch.autograd.Function):
-    """
-    All-gather tensors across DDP processes with autograd support.
+def _stable_str_hash31(s: str) -> int:
+    """Stable 31-bit int hash for strings (useful for deterministic sharding)."""
 
-    This implementation supports variable batch sizes across ranks by padding
-    to the max batch size, gathering, and then unpadding.
-
-    Forward returns a concatenated tensor of shape (sum_i B_i, ...).
-
-    Backward all-reduces the per-rank gradient tensor for every gathered chunk,
-    ensuring that gradients for negatives propagate to the original rank.
-    """
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
-        if not (dist.is_available() and dist.is_initialized()):
-            ctx.is_distributed = False
-            return x
-
-        ctx.is_distributed = True
-        ctx.rank = dist.get_rank()
-        ctx.world_size = dist.get_world_size()
-
-        # gather batch sizes
-        local_bs = torch.tensor([x.size(0)], device=x.device, dtype=torch.long)
-        bs_list = [torch.zeros_like(local_bs) for _ in range(ctx.world_size)]
-        dist.all_gather(bs_list, local_bs)
-        sizes = [int(b.item()) for b in bs_list]
-
-        ctx.sizes = sizes
-        ctx.max_size = max(sizes) if sizes else x.size(0)
-
-        # pad to max_size along dim 0
-        if x.size(0) < ctx.max_size:
-            pad_shape = (ctx.max_size - x.size(0),) + tuple(x.shape[1:])
-            padding = torch.zeros(pad_shape, device=x.device, dtype=x.dtype)
-            x_pad = torch.cat([x, padding], dim=0)
-        else:
-            x_pad = x
-
-        # all_gather padded tensors
-        gathered = [torch.zeros_like(x_pad) for _ in range(ctx.world_size)]
-        dist.all_gather(gathered, x_pad)
-
-        # unpad and concatenate
-        out = []
-        for t, sz in zip(gathered, sizes):
-            out.append(t[:sz])
-        if len(out) == 0:
-            return x
-        return torch.cat(out, dim=0)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        if not getattr(ctx, "is_distributed", False):
-            return grad_output
-
-        world_size = int(ctx.world_size)
-        rank = int(ctx.rank)
-        sizes = list(ctx.sizes)
-        max_size = int(ctx.max_size)
-
-        # split grad_output into per-rank chunks (unpadded)
-        grads = []
-        offset = 0
-        for sz in sizes:
-            grads.append(grad_output[offset: offset + sz])
-            offset += sz
-
-        # pad each chunk back to max_size
-        padded = []
-        for g, sz in zip(grads, sizes):
-            if sz < max_size:
-                pad_shape = (max_size - sz,) + tuple(g.shape[1:])
-                padding = torch.zeros(pad_shape, device=g.device, dtype=g.dtype)
-                g = torch.cat([g, padding], dim=0)
-            padded.append(g)
-
-        # (world, max_size, ...) tensor
-        grad_stack = torch.stack(padded, dim=0)
-
-        # Sum gradients for every gathered chunk across ranks.
-        dist.all_reduce(grad_stack, op=dist.ReduceOp.SUM)
-
-        # Return gradient for this rank's original (unpadded) input
-        grad_input = grad_stack[rank][:sizes[rank]]
-        return grad_input
+    return int(zlib.crc32(s.encode("utf-8")) & 0x7FFFFFFF)
 
 
-def _dist_is_initialized() -> bool:
-    return dist.is_available() and dist.is_initialized()
+def _ddp_all_gather_object_list(local_list: list) -> list:
+    """All-gather a Python list across ranks and concatenate."""
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return list(local_list)
+    world_size = dist.get_world_size()
+    gathered = [None for _ in range(world_size)]
+    dist.all_gather_object(gathered, local_list)
+    out: list = []
+    for part in gathered:
+        if part:
+            out.extend(part)
+    return out
+
+
+def _is_dist_active() -> bool:
+    try:
+        return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    except Exception:
+        return False
 
 
 def _dist_rank() -> int:
-    return dist.get_rank() if _dist_is_initialized() else 0
+    if _is_dist_active():
+        return dist.get_rank()
+    return 0
 
 
-def _dist_world_size() -> int:
-    return dist.get_world_size() if _dist_is_initialized() else 1
+def _dist_world() -> int:
+    if _is_dist_active():
+        return dist.get_world_size()
+    return 1
 
+
+def _dist_all_gather_no_grad(x: torch.Tensor) -> torch.Tensor:
+    """All-gather a tensor across ranks without autograd.
+
+    Notes:
+      * NCCL does not support torch.bool collectives. We therefore cast
+        bool tensors to uint8 for the gather and cast back.
+    """
+
+    if not _is_dist_active():
+        return x
+
+    orig_dtype = x.dtype
+    x_g = x
+    if orig_dtype == torch.bool:
+        x_g = x.to(torch.uint8)
+
+    ws = dist.get_world_size()
+    outs = [torch.zeros_like(x_g) for _ in range(ws)]
+    dist.all_gather(outs, x_g.contiguous())
+    y = torch.cat(outs, dim=0)
+    if orig_dtype == torch.bool:
+        y = y.to(torch.bool)
+    return y
+
+
+class _AllGatherWithGrad(torch.autograd.Function):
+    """AllGather that preserves autograd by slicing the incoming gradient.
+
+    This is the standard CLIP-style trick and avoids relying on
+    torch.distributed.nn.functional.all_gather availability.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        if not _is_dist_active():
+            ctx.world_size = 1
+            ctx.rank = 0
+            ctx.local_n = x.size(0)
+            return x
+
+        ws = dist.get_world_size()
+        rk = dist.get_rank()
+        ctx.world_size = ws
+        ctx.rank = rk
+        ctx.local_n = x.size(0)
+
+        outs = [torch.zeros_like(x) for _ in range(ws)]
+        dist.all_gather(outs, x.contiguous())
+        return torch.cat(outs, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        # If not distributed, gradient is identity.
+        if int(getattr(ctx, 'world_size', 1)) == 1:
+            return grad_out
+
+        rk = int(ctx.rank)
+        n = int(ctx.local_n)
+        start = rk * n
+        end = start + n
+
+        # Each rank's loss produces gradients for every gathered slice.
+        # We need to SUM the slice corresponding to this rank's input across
+        # all ranks so the input receives gradients from all other ranks' losses.
+        grad_input = grad_out.contiguous()[start:end]
+        dist.all_reduce(grad_input, op=dist.ReduceOp.SUM)
+        return grad_input
+
+
+def _dist_all_gather_with_grad(x: torch.Tensor) -> torch.Tensor:
+    """All-gather a tensor across ranks with autograd support.
+
+    Assumes x has the same shape on every rank.
+    """
+
+    if not _is_dist_active():
+        return x
+    return _AllGatherWithGrad.apply(x)
+
+
+# -----------------------------------------------------------------------------
+# Training defaults
+# -----------------------------------------------------------------------------
 
 OPTIMIZER = torch.optim.AdamW
 LR = 3e-4
-FACTOR = 0.1
-PATIENCE = 20
 WEIGHT_DECAY = 0.01
 
-# text generation evaluation arguments
+# text generation evaluation defaults
 BEAM_WIDTH = 3
 DECODE_LENGTH = MAX_LEN_UTTERANCE
 LENGTH_PENALTY_ALPHA = 0.0
-# print arguments
+
 PRINT_EVAL_TEXTGEN_EXAMPLE_IDS = range(10)
 
 
-def mask_hypernyms_when_hyponyms_present(pos_mask: torch.Tensor,
-                                         edges: List[Tuple[int, int]]) -> torch.Tensor:
-    """
-    Given pos_mask (B,C) and directed edges A->B, set mask[:,B]=0 for any
-    example that mentions at least one of B's antecedents A.
-    """
-    if not edges:
-        return pos_mask
-    pm = pos_mask.clone()
-    from collections import defaultdict
-    ant = defaultdict(list)
-    for a, b in edges:
-        ant[b].append(a)
-    for b, As in ant.items():
-        if len(As) == 0:
-            continue
-        present = (pm[:, As].max(dim=1).values > 0.5)
-        pm[present, b] = 0.0
-    return pm
-
-
 class MultiModalLitModel(pl.LightningModule):
-    """
-    PyTorch Lightning class for MultiModal SAYCam model.
-    """
+    """Lightning module for SAYCam CVCL with Object-File MIL + Prototype Memory (Plan A)."""
 
-    def __init__(self, vision_encoder, text_encoder, args):
+    def __init__(self, vision_encoder: nn.Module, text_encoder: nn.Module, args: Optional[argparse.Namespace]):
         super().__init__()
-        self.args = vars(args) if args is not None else {}
+        self.args: Dict[str, Any] = vars(args) if args is not None else {}
 
+        # -------------------------
+        # Optimizer
+        # -------------------------
         self.optimizer_class = self.args.get("optimizer", OPTIMIZER)
-        self.lr = self.args.get("lr", LR)
-        self.lr_scheduler = self.args.get("lr_scheduler", False)
-        self.factor = self.args.get("factor", FACTOR)
-        self.patience = self.args.get("patience", PATIENCE)
-        self.weight_decay = self.args.get("weight_decay", WEIGHT_DECAY)
+        self.lr = float(self.args.get("lr", LR))
+        self.weight_decay = float(self.args.get("weight_decay", WEIGHT_DECAY))
+        self.lr_scheduler = bool(self.args.get("lr_scheduler", False))
+        self.factor = float(self.args.get("factor", 0.1))
+        self.patience = int(self.args.get("patience", 20))
 
-        self.lambda_mm = self.args.get("lambda_mm", 1.0)
-        self.lambda_lm = self.args.get("lambda_lm", 0.0)
-        self.lambda_ar = self.args.get("lambda_ar", 0.0)
-        self.optimize_unused = self.args.get("optimize_unused", False)
-        self.eval_textgen = self.args.get("eval_textgen", False)
-        self.beam_width = self.args.get("beam_width", BEAM_WIDTH)
-        self.decode_length = self.args.get("decode_length", DECODE_LENGTH)
-        self.length_penalty_alpha = self.args.get("length_penalty_alpha", LENGTH_PENALTY_ALPHA)
+        # -------------------------
+        # Objective weights
+        # -------------------------
+        self.lambda_mm = float(self.args.get("lambda_mm", 1.0))
+        # Keep LM losses off unless explicitly enabled.
+        self.lambda_lm = float(self.args.get("lambda_lm", 0.0))
+        self.lambda_ar = float(self.args.get("lambda_ar", 0.0))
+        self.optimize_unused = bool(self.args.get("optimize_unused", False))
 
+        # Text generation eval
+        self.eval_textgen = bool(self.args.get("eval_textgen", False))
+        self.beam_width = int(self.args.get("beam_width", BEAM_WIDTH))
+        self.decode_length = int(self.args.get("decode_length", DECODE_LENGTH))
+        self.length_penalty_alpha = float(self.args.get("length_penalty_alpha", LENGTH_PENALTY_ALPHA))
+
+        # -------------------------
+        # Backbones
+        # -------------------------
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
+
         self.model = MultiModalModel(self.vision_encoder, self.text_encoder, args)
         self.language_model = LanguageModel(self.text_encoder, args)
 
-        # vocab
+        # -------------------------
+        # Vocab / tokenizer
+        # -------------------------
         self.vocab_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocab.json")
-        with open(self.vocab_path) as f:
+        with open(self.vocab_path, "r", encoding="utf-8") as f:
             self.vocab = json.load(f)
         self.nlp = spacy.load("en_core_web_sm")
 
-        # id -> token
-        self.id2tok = None
+        # Caches
+        # - noun_cache: raw string -> tuple(nouns)
+        # - phrase_token_cache: phrase string -> (token_ids, token_len)
+        self._noun_cache = {}
+        self._noun_cache_max = 50000
+        self._phrase_token_cache = {}
+
+        self.id2tok: Optional[Dict[int, str]] = None
         if isinstance(self.vocab, dict):
             self.id2tok = {int(i): tok for tok, i in self.vocab.items()}
         elif hasattr(self.vocab, "itos"):
             itos = list(self.vocab.itos)
             self.id2tok = {i: tok for i, tok in enumerate(itos)}
 
-        # tokens to ignore
         ignore_tokens = ["<pad>", "<unk>", "<sos>", "<eos>", ".", ",", "?", "!", "...", "..", "...."]
         self.ignore_ids = {self.vocab[t] for t in ignore_tokens if t in self.vocab}
 
-        # concepts for NeSy (optional)
-        self.concepts = None
-        self.concept2idx = None
+        # ------------------------------------------------------------------
+        # SAM concept registry (optional)
+        #
+        # Many SAM-prepacked datasets store masks in a *local* concept space
+        # defined by <sam_prepacked_dir>/concept_vocab.json. The registry
+        # provides:
+        #   * local -> global ID remapping (optional global concept list)
+        #   * optional frequency-based filtering (min_masks_per_concept)
+        #   * inverse-frequency weights for long-tail balancing
+        #
+        # IMPORTANT: this does **not** itself load masks; it helps interpret
+        # the concept IDs associated with masks that the DataModule provides.
+        # ------------------------------------------------------------------
+        self.sam_prepacked_dir = self.args.get("sam_prepacked_dir", None)
+        self.sam_concept_frequency_json = self.args.get("sam_concept_frequency_json", None)
+        self.sam_min_masks_per_concept = int(self.args.get("sam_min_masks_per_concept", 0))
+        self.sam_concept_list_file = self.args.get("sam_concept_list_file", None)
+        self.sam_weight_alpha = float(self.args.get("sam_weight_alpha", 0.0))
+        self.sam_weight_clip_min = float(self.args.get("sam_weight_clip_min", 0.25))
+        self.sam_weight_clip_max = float(self.args.get("sam_weight_clip_max", 4.0))
+        self.sam_registry_verbose = bool(self.args.get("sam_registry_verbose", False))
+        self.sam_use_concept_weights = bool(self.args.get("sam_use_concept_weights", False))
 
-        cpath = self.args.get("concept_list_file", None)
-        if cpath and os.path.exists(cpath):
-            with open(cpath) as f:
-                raw = json.load(f)
-            if isinstance(raw, list):
-                self.concepts = [str(c) for c in raw]
-            elif isinstance(raw, dict):
-                # interpret keys as concept names to stay aligned with DataModule
-                self.concepts = [str(k) for k in raw.keys()]
-            else:
-                raise ValueError("concept_list_file must contain a JSON list or dict")
-            assert len(self.concepts) > 0, "Empty concept_list_file"
-            self.concept2idx = {c.lower(): i for i, c in enumerate(self.concepts)}
-            self.ns_edges = build_default_rules(self.concepts)
-        else:
-            self.ns_edges = []
-
-        # NeSy class/edge weights (optional, from utterance mention counts)
-        self.ns_class_weights = None
-        self.ns_edge_weights = None
-        counts_path = self.args.get("ns_class_count_file", None)
-        if counts_path and os.path.exists(counts_path) and self.concepts is not None:
-            import csv
-            concept_names = [c.lower() for c in self.concepts]
-            name2idx = {n: i for i, n in enumerate(concept_names)}
-            counts = np.zeros(len(concept_names), dtype=np.float64)
-            with open(counts_path, newline="") as f:
-                reader = csv.DictReader(f)
-                assert "concept" in reader.fieldnames and "count" in reader.fieldnames, \
-                    "Counts CSV must have headers: concept,count"
-                for row in reader:
-                    n = row["concept"].strip().lower()
-                    if n in name2idx:
-                        try:
-                            cval = float(row["count"])
-                        except Exception:
-                            cval = 0.0
-                        counts[name2idx[n]] += cval
-            counts = np.maximum(counts, 1.0)
-            alpha = float(self.args.get("ns_weight_power", 1.0))
-            w = (np.median(counts) / counts) ** alpha
-            w = np.clip(
-                w,
-                self.args.get("ns_weight_min", 0.33),
-                self.args.get("ns_weight_max", 3.0),
-            )
-            # normalize so average weight is 1
-            w = w * (len(w) / w.sum())
-
-            self.ns_class_weights = torch.tensor(w, dtype=torch.float32)
-            if len(self.ns_edges):
-                scheme = self.args.get("ns_edge_weight_scheme", "mean")
-                self.ns_edge_weights = build_edge_weights(self.ns_class_weights, self.ns_edges, scheme=scheme)
+        self.sam_registry: Optional[SamConceptRegistry] = None
+        if self.sam_prepacked_dir is not None and build_sam_concept_registry is not None:
             try:
-                if self.global_rank == 0:
-                    print("[NeSy] Loaded class weights from", counts_path)
-                    for c, wt in zip(self.concepts, w):
-                        print(f"  {c:>10s}: {wt:.3f}")
-            except Exception:
-                pass
+                self.sam_registry = build_sam_concept_registry(
+                    sam_prepacked_dir=self.sam_prepacked_dir,
+                    concept_frequency_json=self.sam_concept_frequency_json,
+                    min_masks_per_concept=self.sam_min_masks_per_concept,
+                    concept_list_file=self.sam_concept_list_file,
+                    alpha=self.sam_weight_alpha,
+                    clip_min=self.sam_weight_clip_min,
+                    clip_max=self.sam_weight_clip_max,
+                    verbose=self.sam_registry_verbose,
+                )
+            except Exception as e:  # pragma: no cover
+                # Fail soft: training can proceed (MIL will simply not use
+                # concept-aware filtering/weights).
+                if int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0"))) == 0:
+                    print(f"[multimodal_lit] WARNING: failed to build SamConceptRegistry: {e}")
+                self.sam_registry = None
 
-        # -------- Visual Memory (object-centric, concept-conditioned) --------
-        self.vm = None
-        self.vm_lambda = float(self.args.get("vm_lambda", 0.2))
-        self.vm_warmup_steps = int(self.args.get("vm_warmup_steps", 0))
+        # One-time warning if MIL is enabled but the dataloader never supplies SAM masks.
+        self._warned_missing_sam_mask = False
 
-        # embedding dimension of the VM space; object encoder projects into this
-        vm_dim = self.args.get("vm_embedding_dim", None)
-        if vm_dim is None:
-            vm_dim = self.args.get("embedding_dim", 128)
-        self.vm_obj_out_dim = int(vm_dim)
-        # ObjectAppearanceEncoder is instantiated lazily on first batch when dims are known
-        self.obj_encoder: ObjectAppearanceEncoder | None = None
+        # ------------------------------------------------------------------
+        # Object-file MIL (Plan A)
+        # ------------------------------------------------------------------
+        self.mil_enable = bool(self.args.get("mil_enable", True))
+        # If True, also compute MIL/track losses on val/test (for monitoring),
+        # but **never** update prototype EMA with val/test data.
+        self.mil_run_val = bool(self.args.get("mil_run_val", True))
+        self.mil_lambda = float(self.args.get("mil_lambda", 0.10))
+        # Temperature used for logsumexp over tracks and for contrastive logits.
+        self.mil_tau = float(self.args.get("mil_tau", 0.05))
+        self.mil_min_mask_area = float(self.args.get("mil_min_mask_area", 0.01))
 
-        if self.args.get("vm_enable", False):
-            if self.concepts is not None and len(self.concepts) > 0:
-                vm_num_concepts = len(self.concepts)
-            else:
-                vm_num_concepts = int(self.args.get("vm_num_concepts", 0))
+        self.mil_track = bool(self.args.get("mil_track", True))
+        self.mil_track_sim_thresh = float(self.args.get("mil_track_sim_thresh", 0.55))
+        self.mil_track_max_tracks = int(self.args.get("mil_track_max_tracks", 16))
 
-            vm_protos_per_concept = int(self.args.get("vm_protos_per_concept", 0))
+        # Mask->embedding pooling
+        self.mil_obj_ring_weight = float(self.args.get("mil_obj_ring_weight", 0.05))
+        self.mil_obj_ring_px_fmap = int(self.args.get("mil_obj_ring_px_fmap", 1))
 
-            # VisualMemory does usage-based reweighting internally using usage_* hyperparameters
-            self.vm = VisualMemory(
-                embedding_dim=self.vm_obj_out_dim,
-                num_concepts=vm_num_concepts,
-                protos_per_concept=vm_protos_per_concept,
-                bank_capacity=int(self.args.get("vm_bank_capacity", 512)),
-                tau=float(self.args.get("vm_tau", 0.5)),
-                beta=float(self.args.get("vm_beta", 0.25)),
-                use_soft_assignment=not bool(self.args.get("vm_hard_assignment", False)),
-                enable_temporal=bool(self.args.get("vm_temporal", True)),
-                t_window=int(self.args.get("vm_t_window", 2)),
-                temporal_weight=float(self.args.get("vm_t_weight", 1.0)),
-                sep_margin=float(self.args.get("vm_sep_margin", 0.5)),
-                sep_weight=float(self.args.get("vm_sep_weight", 0.1)),
-                enable_usage_reweighting=self.args.get("vm_enable_usage_reweighting", False),
-                usage_smoothing=float(self.args.get("vm_usage_smoothing", 1.0)),
-                usage_power=float(self.args.get("vm_usage_power", 1.0)),
-                usage_min=float(self.args.get("vm_usage_min", 0.33)),
-                usage_max=float(self.args.get("vm_usage_max", 3.0)),
-                use_sinkhorn=bool(self.args.get("vm_use_sinkhorn", True)),
-                sinkhorn_iters=int(self.args.get("vm_sinkhorn_iters", 3)),
-                sinkhorn_epsilon=float(self.args.get("vm_sinkhorn_epsilon", 0.05)),
-                sinkhorn_min_samples=int(self.args.get("vm_sinkhorn_min_samples", 2)),
-                temporal_same_concept_only=bool(self.args.get("vm_temp_same_concept_only", True)),
-                temporal_sim_thresh=float(self.args.get("vm_temp_sim_thresh", 0.3)),
-                temporal_detach_target=bool(self.args.get("vm_temp_detach_target", True)),
+        # Patch fallback when SAM masks vanish at feature-map resolution or are missing.
+        #   * If a mask becomes empty after downsampling to the feature-map grid,
+        #     we sample a patch embedding around the mask centroid.
+        #   * If a frame has no valid masks, we sample top-k patch embeddings from the feature map.
+        self.mil_patch_topk = int(self.args.get("mil_patch_topk", 4))
+        self.mil_patch_radius = int(self.args.get("mil_patch_radius", 1))
+
+
+        # MIL text query mode (sentence vs nouns)
+        self.mil_text_mode = str(self.args.get("mil_text_mode", "sentence")).lower()
+        self.mil_noun_max = int(self.args.get("mil_noun_max", 5))
+        self.mil_noun_min_chars = int(self.args.get("mil_noun_min_chars", 2))
+        self.mil_noun_use_lemma = bool(self.args.get("mil_noun_use_lemma", True))
+        self.mil_noun_keep_propn = bool(self.args.get("mil_noun_keep_propn", True))
+        self.mil_noun_vocab_only = bool(self.args.get("mil_noun_vocab_only", True))
+        self.mil_noun_dedup = bool(self.args.get("mil_noun_dedup", True))
+
+        # Pivot C: object<->concept alignment using SAM concept IDs (optional)
+        self.sam_concept_align_enable = bool(self.args.get("sam_concept_align_enable", False))
+        self.sam_concept_align_lambda = float(self.args.get("sam_concept_align_lambda", 0.05))
+        self.sam_concept_align_tau = float(self.args.get("sam_concept_align_tau", 0.07))
+
+        # Alignment gating weight w_align
+        self.w_align_sim0 = float(self.args.get("w_align_sim0", 0.10))
+        self.w_align_simscale = float(self.args.get("w_align_simscale", 0.05))
+        self.w_align_warmup_steps = int(self.args.get("w_align_warmup_steps", 500))
+        self.w_align_min = float(self.args.get("w_align_min", 0.05))
+
+        # Track coherence loss
+        self.track_coh_enable = bool(self.args.get("track_coh_enable", True))
+        self.track_coh_lambda = float(self.args.get("track_coh_lambda", 0.05))
+        self.track_coh_match_thresh = float(self.args.get("track_coh_match_thresh", 0.30))
+        self.track_coh_min_frames = int(self.args.get("track_coh_min_frames", 2))
+
+        # Global-object agreement loss
+        self.go_enable = bool(self.args.get("go_enable", True))
+        self.go_lambda = float(self.args.get("go_lambda", 0.05))
+
+        # ------------------------------------------------------------------
+        # Prototype memory (visual vocabulary)
+        # ------------------------------------------------------------------
+        self.embedding_dim = int(self.args.get("embedding_dim", 128))
+
+        # Some experimental branches (e.g. noun-only alignment pivots) refer to
+        # the shared image/text contrastive embedding dimensionality as
+        # `proj_dim`. Historically this name came from an earlier projection-head
+        # implementation. In the current codebase the correct dimension is the
+        # same as `embedding_dim`.
+        #
+        # Keep this attribute to avoid crashes when those branches are enabled.
+        self.proj_dim = int(self.embedding_dim)
+
+        self.proto_enable = bool(self.args.get("proto_enable", True))
+        self.proto_num = int(self.args.get("proto_num", 64))
+        self.proto_tau = float(self.args.get("proto_tau", 0.07))
+
+        self.proto_use_sinkhorn = bool(self.args.get("proto_use_sinkhorn", True))
+        self.proto_sinkhorn_iters = int(self.args.get("proto_sinkhorn_iters", 3))
+        self.proto_sinkhorn_epsilon = float(self.args.get("proto_sinkhorn_epsilon", 0.05))
+        self.proto_sinkhorn_min_samples = int(self.args.get("proto_sinkhorn_min_samples", 32))
+
+        self.proto_ema_decay = float(self.args.get("proto_ema_decay", 0.99))
+        self.proto_ema_eps = float(self.args.get("proto_ema_eps", 1e-3))
+        self.proto_ema_ddp_sync = bool(self.args.get("proto_ema_ddp_sync", True))
+
+        # Warm-start (one-shot) for prototypes
+        self.proto_warm_start = bool(self.args.get("proto_warm_start", True))
+        self.proto_warm_min_local = int(self.args.get("proto_warm_min_local", 128))
+        # Select warm-start examples by *embedding-space* text-track cosine.
+        self.proto_warm_sim_thresh = float(self.args.get("proto_warm_sim_thresh", 0.25))
+        self.proto_warm_max_total = int(self.args.get("proto_warm_max_total", 4096))
+        self.proto_warm_kmeans_iters = int(self.args.get("proto_warm_kmeans_iters", 10))
+
+        self._proto_warm_started = False
+        self._proto_warm_buffer: List[torch.Tensor] = []  # CPU tensors (D,)
+
+        self.proto_mem: Optional[PrototypeMemory] = None
+        if self.proto_enable:
+            self.proto_mem = PrototypeMemory(
+                embedding_dim=self.embedding_dim,
+                num_prototypes=self.proto_num,
+                tau=self.proto_tau,
+                use_sinkhorn=self.proto_use_sinkhorn,
+                sinkhorn_iters=self.proto_sinkhorn_iters,
+                sinkhorn_epsilon=self.proto_sinkhorn_epsilon,
+                sinkhorn_min_samples=self.proto_sinkhorn_min_samples,
+                ema_decay=self.proto_ema_decay,
+                ema_eps=self.proto_ema_eps,
+                ema_ddp_sync=self.proto_ema_ddp_sync,
             )
 
-            if self.concepts is not None:
-                self.vm.set_concept_names(self.concepts)
+        # ------------------------------------------------------------------
+        # Null track and optional image adapter
+        # ------------------------------------------------------------------
+        # Null is used when there are no valid tracks (or to let MIL ignore a sample).
+        self.null_obj = nn.Parameter(torch.randn(self.embedding_dim, dtype=torch.float32))
 
-            if self.obj_encoder is None:
-                dim_global = int(self.args.get("embedding_dim", 128))
-                dim_local = self.args.get("vm_fmap_dim", None)
+        self.img_adapter_enable = bool(self.args.get("img_adapter_enable", True))
+        if self.img_adapter_enable:
+            self.img_adapter = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
+            with torch.no_grad():
+                self.img_adapter.weight.copy_(torch.eye(self.embedding_dim))
+        else:
+            self.img_adapter = nn.Identity()
 
-                if dim_local is None:
-                    try:
-                        with torch.no_grad():
-                            dummy_h = 224
-                            dummy_w = 224
-                            dummy = torch.zeros(1, 3, dummy_h, dummy_w)
-                            dummy_global, dummy_fmap = self.model.encode_image(dummy)
-                            dim_global = int(dummy_global.size(-1))
-                            if dummy_fmap is not None:
-                                dim_local = int(dummy_fmap.size(1))
-                    except Exception:
-                        dim_local = None
+        # ------------------------------------------------------------------
+        # Debug visualization
+        # ------------------------------------------------------------------
+        self.debug_save_tracks = bool(self.args.get("debug_save_tracks", False))
+        self.debug_tracks_topk = int(self.args.get("debug_tracks_topk", 6))
+        self.debug_tracks_every_n_epochs = int(self.args.get("debug_tracks_every_n_epochs", 10))
+        self.debug_tracks_overlay_alpha = float(self.args.get("debug_tracks_overlay_alpha", 0.45))
 
-                if dim_local is None:
-                    raise ValueError(
-                        "vm_enable requires vm_fmap_dim (channel dimension of the conv feature map), "
-                        "or a vision encoder whose encode_image returns a non-None feature map."
-                    )
+        self._dbg_track_heap: List[Tuple[float, Dict[str, Any]]] = []
 
-                self.obj_encoder = ObjectAppearanceEncoder(
-                    dim_global=int(dim_global),
-                    dim_local=int(dim_local),
-                    dim_out=self.vm_obj_out_dim,
-                    use_local=True,
-                    local_weight=float(self.args.get("vm_local_weight", 1.0)),
-                    learn_local_weight=bool(self.args.get("vm_learn_local_weight", False)),
-                )
-
-        self.vm_log_gradcam = bool(getattr(args, "vm_log_gradcam", False))
-        # VM debug flags
-        self.vm_debug_verbose = bool(self.args.get("vm_debug_verbose", False))
-        self.vm_debug_log_images_every = int(self.args.get("vm_debug_log_images_every", 0))
-
-        # save hyperparameters to logger
+        # IMPORTANT: keep save_hyperparameters() unfiltered so load_from_checkpoint can reconstruct.
         self.save_hyperparameters()
 
     # ------------------------------------------------------------------
-    # Small helpers
+    # DDP tensor helpers
     # ------------------------------------------------------------------
+    def _dist_all_gather_no_grad(self, x: torch.Tensor) -> torch.Tensor:
+        return _dist_all_gather_no_grad(x)
 
-    def _unnorm_for_viz(self, imgs: torch.Tensor) -> torch.Tensor:
-        """
-        Convert normalized images back to [0,1] range for visualization or edge maps.
-        Assumes ImageNet-style normalization.
-        """
-        mean = torch.tensor([0.485, 0.456, 0.406], device=imgs.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=imgs.device).view(1, 3, 1, 1)
-        imgs = imgs.float()
-        return (imgs * std + mean).clamp(0, 1)
+    def _dist_all_gather_with_grad(self, x: torch.Tensor) -> torch.Tensor:
+        return _dist_all_gather_with_grad(x)
 
-    def _get_global_rank(self) -> int:
-        """
-        Try trainer.global_rank first, fall back to self.global_rank, default 0.
-        """
-        trainer = getattr(self, "trainer", None)
-        if trainer is not None and hasattr(trainer, "global_rank"):
-            try:
-                return int(trainer.global_rank)
-            except Exception:
-                pass
-        try:
-            return int(getattr(self, "global_rank", 0))
-        except Exception:
-            return 0
+    def _dist_rank(self) -> int:
+        return _dist_rank()
+
+    def _dist_world(self) -> int:
+        return _dist_world()
 
     # ------------------------------------------------------------------
-    # DDP-safe contrastive loss
+    # Argparse
     # ------------------------------------------------------------------
-
-    def _gather_batch_sizes(self, local_bs: int, device: torch.device) -> List[int]:
-        """
-        Gather per-rank batch sizes (B_i) and return as a Python list in rank order.
-        """
-        if not _dist_is_initialized():
-            return [int(local_bs)]
-        bs = torch.tensor([int(local_bs)], device=device, dtype=torch.long)
-        bs_list = [torch.zeros_like(bs) for _ in range(_dist_world_size())]
-        dist.all_gather(bs_list, bs)
-        return [int(b.item()) for b in bs_list]
-
-    def calculate_contrastive_loss_ddp(self, x, y, y_len):
-        """
-        Contrastive loss with global (multi-GPU) negatives.
-
-        Returns:
-            infonce_loss, image_accuracy, text_accuracy,
-            image_entropy, text_entropy,
-            logits_per_image, logits_per_text,
-            image_features, image_feature_map, text_outputs
-        """
-        # encode
-        image_features, image_feature_map = self.model.encode_image(x)
-        text_features, text_outputs = self.model.encode_text(y, y_len)
-
-        local_bs = int(image_features.size(0))
-        device = image_features.device
-
-        # gather features (with grad) for global negatives
-        if _dist_is_initialized() and _dist_world_size() > 1:
-            sizes = self._gather_batch_sizes(local_bs, device=device)
-            rank = _dist_rank()
-            world_size = _dist_world_size()
-            global_bs = int(sum(sizes))
-            offset = int(sum(sizes[:rank]))
-
-            all_image_features = _AllGatherWithGrad.apply(image_features)
-            all_text_features = _AllGatherWithGrad.apply(text_features)
-
-            labels = torch.arange(local_bs, device=device, dtype=torch.long) + offset
-
-            # Correct scaling under DDP gradient averaging (robust to variable local batch sizes):
-            # Each rank computes a scaled local sum so that DDP's gradient averaging yields the global mean.
-            scale = float(world_size) / float(max(global_bs, 1))
-        else:
-            all_image_features = image_features
-            all_text_features = text_features
-            labels = torch.arange(local_bs, device=device, dtype=torch.long)
-            scale = 1.0
-
-        # logits
-        logit_scale = (-self.model.logit_neg_log_temperature).exp()
-        logits_per_image = logit_scale * image_features @ all_text_features.t()
-        logits_per_text = logit_scale * text_features @ all_image_features.t()
-
-        # losses (sum then scale so DDP average gives global mean)
-        loss_i = F.cross_entropy(logits_per_image, labels, reduction="sum") * scale
-        loss_t = F.cross_entropy(logits_per_text, labels, reduction="sum") * scale
-        infonce_loss = (loss_i + loss_t) / 2.0
-
-        # metrics on local anchors vs global candidates
-        with torch.no_grad():
-            image_accuracy = (logits_per_image.argmax(dim=1) == labels).float().mean()
-            text_accuracy = (logits_per_text.argmax(dim=1) == labels).float().mean()
-
-            image_entropy = get_entropy(logits_per_image)
-            if torch.is_tensor(image_entropy) and image_entropy.ndim > 0:
-                image_entropy = image_entropy.mean()
-
-            text_entropy = get_entropy(logits_per_text)
-            if torch.is_tensor(text_entropy) and text_entropy.ndim > 0:
-                text_entropy = text_entropy.mean()
-
-        return (
-            infonce_loss,
-            image_accuracy,
-            text_accuracy,
-            image_entropy,
-            text_entropy,
-            logits_per_image,
-            logits_per_text,
-            image_features,
-            image_feature_map,
-            text_outputs,
-        )
-
-    def _log_vm_histogram_to_wandb(self, stage: str) -> None:
-        """
-        Log histogram of running concept mask-instance counts to W&B using wandb.log.
-        Safe under DDP (rank 0 only) and no-op if no active run.
-        """
-        if wandb is None:
-            return
-        run = getattr(wandb, "run", None)
-        if run is None:
-            # WandbLogger has not called wandb.init() yet
-            return
-        if self.vm is None or not hasattr(self.vm, "concept_mask_counts"):
-            return
-        if self.vm.concept_mask_counts is None or self.vm.concept_mask_counts.numel() == 0:
-            return
-
-        global_rank = self._get_global_rank()
-        if global_rank != 0:
-            return
-
-        counts = (
-            self.vm.concept_mask_counts
-            .clone()
-            .detach()
-            .float()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-        )
-        step_int = int(getattr(self, "global_step", 0))
-
-        if self.vm_debug_verbose and step_int < 10:
-            print(
-                f"[VM-hist] logging histogram at step={step_int}, "
-                f"num_bins={len(counts)}, sum={counts.sum()}"
-            )
-
-        try:
-            wandb.log(
-                {f"{stage}/vm_concept_mask_hist": wandb.Histogram(counts)},
-                step=step_int,
-            )
-        except Exception as e:
-            if self.vm_debug_verbose:
-                print("[VM-hist] failed to log histogram:", repr(e))
-
-    def _log_vm_prompt_panels_to_wandb(
-        self,
-        tag: str,
-        imgs: torch.Tensor,        # (N,3,H,W) in [0,1]
-        masks: torch.Tensor,       # (N,1,H,W) in {0,1}
-        concept_ids: torch.Tensor, # (N,)
-        max_images: int = 12,
-        overlay_alpha: float = 0.4,
-    ) -> None:
-        if wandb is None:
-            return
-        logger = getattr(self, "logger", None)
-        if logger is None:
-            return
-        experiment = getattr(logger, "experiment", None)
-        if experiment is None:
-            return
-
-        if imgs.ndim != 4 or masks.ndim != 4 or imgs.size(0) == 0:
-            return
-
-        n = min(int(max_images), int(imgs.size(0)))
-        imgs = imgs[:n].detach().cpu()
-        masks = masks[:n].detach().cpu()
-        concept_ids = concept_ids[:n].detach().cpu()
-
-        # overlay on original
-        overlays = overlay_masks_on_images(imgs, masks, alpha=float(overlay_alpha)).clamp(0.0, 1.0)
-
-        # blur-filled prompt (with ring + feather)
-        blur_ksize = int(self.args.get("vm_bg_blur_kernel", 23))
-        blur_sigma = float(self.args.get("vm_bg_blur_sigma", 5.0))
-        bg = gaussian_blur2d(imgs, kernel_size=blur_ksize, sigma=blur_sigma)  # reflect padding default
-
-        ring_px = int(self.args.get("vm_ctx_ring_px", 0))
-        ring_strength = float(self.args.get("vm_ctx_ring_strength", 1.0))
-        feather_sigma = float(self.args.get("vm_mask_feather_sigma", 0.0))
-        feather_kernel = int(self.args.get("vm_mask_feather_kernel", 0))
-        feather_kernel = None if feather_kernel <= 0 else feather_kernel
-
-        alpha_mask = make_context_alpha(
-            masks,
-            ring_px=ring_px,
-            ring_strength=ring_strength,
-            feather_sigma=feather_sigma,
-            feather_kernel=feather_kernel,
-        )
-        prompts = (imgs * alpha_mask + bg * (1.0 - alpha_mask)).clamp(0.0, 1.0)
-
-        # side-by-side panels: [orig | overlay | prompt]
-        panels = torch.cat([imgs, overlays, prompts], dim=3)  # concat along width
-
-        images = []
-        for i in range(n):
-            panel = panels[i].permute(1, 2, 0).numpy()
-            cid = int(concept_ids[i].item())
-            caption = (
-                f"cid={cid} | orig|overlay|prompt "
-                f"(ring_px={ring_px}, ring_str={ring_strength}, feather_sigma={feather_sigma})"
-            )
-            images.append(wandb.Image(panel, caption=caption))
-
-        step_int = int(getattr(self, "global_step", 0))
-        try:
-            experiment.log({tag: images}, step=step_int)
-        except TypeError:
-            experiment.log({tag: images})
-
-    # ------------------------------------------------------------------
-    # GradCAM helpers
-    # ------------------------------------------------------------------
-
-    def _compute_gradcam_from_logits(
-        self,
-        logits_per_image: torch.Tensor,
-        image_feature_map: torch.Tensor,
-        max_examples: int = 4,
-    ):
-        """
-        Compute GradCAM maps for the diagonal image–text pairs in the batch.
-
-        Args:
-            logits_per_image: (B, B) contrastive logits matrix.
-            image_feature_map: (B, E, H, W) last conv feature map from VisionEncoder.
-            max_examples: number of examples to visualize from the batch.
-
-        Returns:
-            cam: (K, 1, H, W) GradCAM heatmaps normalized to [0, 1], or None.
-            idx: (K,) indices of the examples used, or None.
-        """
-        if image_feature_map is None:
-            return None, None
-        if not torch.is_grad_enabled():
-            return None, None
-        if not image_feature_map.requires_grad:
-            return None, None
-
-        B = logits_per_image.size(0)
-        device = logits_per_image.device
-
-        diag_scores = logits_per_image[
-            torch.arange(B, device=device),
-            torch.arange(B, device=device)
-        ]  # (B,)
-
-        K = min(B, max_examples)
-        idx = torch.arange(K, device=device)
-
-        scores_sel = diag_scores[idx]      # (K,)
-        fmap_sel = image_feature_map[idx]  # (K, E, H, W)
-
-        grads = torch.autograd.grad(
-            outputs=scores_sel.sum(),
-            inputs=fmap_sel,
-            retain_graph=False,
-            create_graph=False,
-            only_inputs=True,
-            allow_unused=True,
-        )[0]
-        if grads is None:
-            return None, None
-
-        weights = grads.mean(dim=(2, 3), keepdim=True)      # (K, E, 1, 1)
-        cam = (weights * fmap_sel).sum(dim=1, keepdim=True)  # (K, 1, H, W)
-        cam = F.relu(cam)
-
-        K_, _, H, W = cam.shape
-        cam_flat = cam.view(K_, -1)
-        cam_flat = cam_flat - cam_flat.min(dim=1, keepdim=True)[0]
-        cam_max = cam_flat.max(dim=1, keepdim=True)[0]
-        cam_max[cam_max < 1e-8] = 1.0
-        cam_flat = cam_flat / cam_max
-        cam = cam_flat.view(K_, 1, H, W)
-
-        return cam.detach(), idx
-
-    def _log_gradcam_debug_images(
-        self,
-        images: torch.Tensor,   # (B, 3, H, W) normalized batch
-        y: torch.Tensor,
-        y_len: torch.Tensor | None,
-        stage: str,
-        batch_idx: int,
-        max_examples: int = 4,
-    ):
-        """
-        Run a small separate forward pass with gradients to get a GradCAM
-        visualization of the contrastive logits. This does not affect the main
-        training graph or loss.
-        """
-        if not self.vm_log_gradcam or self.vm_debug_log_images_every <= 0:
-            return
-        if stage != "train":
-            return
-
-        trainer = getattr(self, "trainer", None)
-        if trainer is not None and getattr(trainer, "global_rank", 0) != 0:
-            return
-        if self.logger is None or not hasattr(self.logger, "experiment"):
-            return
-
-        step = int(getattr(self, "global_step", 0))
-        if step % self.vm_debug_log_images_every != 0:
-            return
-
-        B = images.size(0)
-        if B == 0:
-            return
-
-        K = min(B, max_examples)
-
-        with torch.enable_grad():
-            x_cam = images[:K].detach().to(self.device)
-            x_cam.requires_grad_(True)
-
-            y_cam = y[:K].detach().to(self.device)
-            y_len_cam = y_len[:K].detach().to(self.device) if y_len is not None else None
-
-            # fresh forward through encoders (no detaching here)
-            img_feats, fmap = self.model.encode_image(x_cam)
-            if fmap is None or not fmap.requires_grad:
-                return
-
-            txt_feats, _ = self.model.encode_text(y_cam, y_len_cam)
-
-            logit_scale = (-self.model.logit_neg_log_temperature).exp()
-            logits_per_image = logit_scale * img_feats @ txt_feats.t()  # (K,K)
-
-            cam, idx = self._compute_gradcam_from_logits(
-                logits_per_image, fmap, max_examples=K
-            )
-            if cam is None or idx is None:
-                return
-
-            images_sel = x_cam[idx].detach().cpu()
-            cam_sel = cam.detach().cpu()
-
-        # de-normalize for visualization
-        imgs_vis = self._unnorm_for_viz(images_sel)
-
-        # upsample CAM to image size
-        cam_up = F.interpolate(
-            cam_sel,
-            size=imgs_vis.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )  # (K,1,H,W)
-
-        alpha = 0.5
-        cam_rgb = cam_up.repeat(1, 3, 1, 1)          # (K,3,H,W)
-        overlay = (1.0 - alpha) * imgs_vis + alpha * cam_rgb
-        overlay = overlay.clamp(0.0, 1.0)
-
-        grid = torchvision.utils.make_grid(
-            torch.cat([imgs_vis, cam_rgb, overlay], dim=0),
-            nrow=K,
-        )
-
-        exp = self.logger.experiment
-        try:
-            import wandb
-
-            exp.log(
-                {
-                    f"{stage}/gradcam_debug": wandb.Image(
-                        grid,
-                        caption=f"{stage} step={step} batch={batch_idx}",
-                    )
-                },
-                step=step,
-            )
-        except ImportError:
-            if hasattr(exp, "add_image"):
-                exp.add_image(
-                    f"{stage}/gradcam_debug",
-                    grid,
-                    global_step=step,
-                )
-
-    def decode_ids_to_tokens(self, u):
-        """
-        Accepts nested tensors/lists of ids or raw strings.
-        Returns a flat list[str] of lowercase tokens with specials/punct removed.
-        """
-        import re
-
-        def _flatten(obj):
-            if torch.is_tensor(obj):
-                obj = obj.tolist()
-            if isinstance(obj, (list, tuple)):
-                for x in obj:
-                    yield from _flatten(x)
-            else:
-                yield obj
-
-        toks = []
-        for item in _flatten(u):
-            if isinstance(item, int):
-                if self.id2tok is None:
-                    continue
-                if int(item) in self.ignore_ids:
-                    continue
-                toks.append(self.id2tok.get(int(item), "<unk>"))
-            elif isinstance(item, str):
-                toks.extend([w for w in re.split(r"[^a-zA-Z]+", item.lower()) if w])
-        return toks
-
     @staticmethod
-    def add_to_argparse(parser):
+    def add_to_argparse(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        # NOTE: train.py wires multiple ArgumentParser groups together
+        # (data module + lit module). Some flags (e.g., SAM dataset flags)
+        # may already be registered by the data module. We therefore add a
+        # small helper to avoid hard crashes on duplicate option strings.
+        def _safe_add(*args, **kwargs):
+            try:
+                parser.add_argument(*args, **kwargs)
+            except argparse.ArgumentError:
+                return
+
+        # Optimizer
         parser.add_argument("--optimizer", type=lambda o: getattr(torch.optim, o), default=OPTIMIZER)
         parser.add_argument("--lr", type=float, default=LR)
-        parser.add_argument("--lr_scheduler", action="store_true")
-        parser.add_argument("--factor", type=float, default=FACTOR)
-        parser.add_argument("--patience", type=int, default=PATIENCE)
         parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY)
+        parser.add_argument("--lr_scheduler", action="store_true")
+        parser.add_argument("--factor", type=float, default=0.1)
+        parser.add_argument("--patience", type=int, default=20)
+
+        # Main loss
         parser.add_argument("--lambda_mm", type=float, default=1.0)
         parser.add_argument("--lambda_lm", type=float, default=0.0)
         parser.add_argument("--lambda_ar", type=float, default=0.0)
         parser.add_argument("--optimize_unused", action="store_true")
+
+        # Optional text generation eval
         parser.add_argument("--eval_textgen", action="store_true")
         parser.add_argument("--beam_width", type=int, default=BEAM_WIDTH)
         parser.add_argument("--decode_length", type=int, default=DECODE_LENGTH)
         parser.add_argument("--length_penalty_alpha", type=float, default=LENGTH_PENALTY_ALPHA)
 
-        # ---- For Neuro Symbolic Experiment (From our previous attempt) ----
-        parser.add_argument("--neurosym", action="store_true")
-        parser.add_argument("--ns_lambda_exist", type=float, default=0.5)
-        parser.add_argument("--ns_lambda_hier", type=float, default=0.1)
-        parser.add_argument("--concept_list_file", type=str, default=None)
-        parser.add_argument("--ns_class_count_file", type=str, default=None)
-        parser.add_argument("--ns_weight_power", type=float, default=1.0)
-        parser.add_argument("--ns_weight_min", type=float, default=0.33)
-        parser.add_argument("--ns_weight_max", type=float, default=3.0)
-        parser.add_argument("--ns_edge_weight_scheme", type=str, default="mean",
-                            choices=["a", "b", "mean", "geomean"])
-        # ----
-
-        # ---- Visual Memory (train-only, object-centric) ----
-        parser.add_argument("--vm_enable", action="store_true",
-                            help="enable visual memory (prototype bank)")
-        parser.add_argument("--vm_lambda", type=float, default=0.2,
-                            help="weight for visual memory loss")
-        parser.add_argument("--vm_embedding_dim", type=int, default=None,
-                            help="embedding dimension for visual memory; "
-                                 "defaults to model embedding_dim")
-        parser.add_argument("--vm_fmap_dim", type=int, default=None,
-                            help="channel dimension of conv feature map; kept for compatibility")
-
-        parser.add_argument("--vm_bank_capacity", type=int, default=512,
-                            help="capacity of prototype bank (ignored if protos_per_concept > 0)")
-
-        # concept-conditioned layout
-        parser.add_argument("--vm_num_concepts", type=int, default=0,
-                            help="number of concepts for VM; if 0, inferred from concept_list_file when present")
-        parser.add_argument("--vm_protos_per_concept", type=int, default=0,
-                            help="number of prototypes per concept; if 0, memory is global")
-
-        # temporal consistency
-        parser.add_argument("--vm_temporal", dest="vm_temporal", action="store_true",
-                            help="enable temporal consistency using clip/frame metadata")
-        parser.add_argument("--vm_no_temporal", dest="vm_temporal", action="store_false",
-                            help=argparse.SUPPRESS)
-
-        parser.add_argument("--vm_t_window", type=int, default=5,
-                            help="max frame distance inside a clip to form temporal positives")
-        parser.add_argument("--vm_t_weight", type=float, default=1.0,
-                            help="relative weight of temporal positives")
-
-        parser.add_argument("--vm_warmup_steps", type=int, default=0,
-                            help="steps before applying the VM loss")
-
-        # VQ / assignment and separation
-        parser.add_argument("--vm_tau", type=float, default=0.5,
-                            help="temperature for VM soft assignment")
-        parser.add_argument("--vm_beta", type=float, default=0.25,
-                            help="commitment weight for VQ-style VM loss")
-        parser.add_argument("--vm_hard_assignment", action="store_true",
-                            help="use hard nearest-prototype assignment instead of soft")
-        parser.add_argument("--vm_sep_margin", type=float, default=0.5,
-                            help="margin for prototype separation loss")
-        parser.add_argument("--vm_sep_weight", type=float, default=0.1,
-                            help="weight for prototype separation loss")
-        parser.add_argument("--vm_bg_blur_kernel", type=int, default=23,
-                            help="Gaussian blur kernel size (odd int) for blurred background fill.")
-        parser.add_argument("--vm_bg_blur_sigma", type=float, default=5.0,
-                            help="Gaussian blur sigma for blurred background fill.")
-
-        # --- Sinkhorn balancing ---
-        parser.add_argument("--vm_use_sinkhorn", dest="vm_use_sinkhorn", action="store_true",
-                            help="Use Sinkhorn-Knopp balanced assignments for VM.")
-        parser.add_argument("--vm_no_sinkhorn", dest="vm_use_sinkhorn", action="store_false",
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_sinkhorn_iters", type=int, default=3)
-        parser.add_argument("--vm_sinkhorn_epsilon", type=float, default=0.05)
-        parser.add_argument("--vm_sinkhorn_min_samples", type=int, default=2)
-
-        # --- Temporal assignment distillation controls ---
-        parser.add_argument("--vm_temp_same_concept_only", dest="vm_temp_same_concept_only", action="store_true",
-                            help="Temporal positives only within same concept id.")
-        parser.add_argument("--vm_temp_allow_cross_concept", dest="vm_temp_same_concept_only", action="store_false",
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_temp_sim_thresh", type=float, default=0.3,
-                            help="Cosine similarity threshold to accept temporal positives.")
-        parser.add_argument("--vm_temp_detach_target", dest="vm_temp_detach_target", action="store_true",
-                            help="Detach target distribution in temporal loss.")
-        parser.add_argument("--vm_temp_no_detach_target", dest="vm_temp_detach_target", action="store_false",
-                            help=argparse.SUPPRESS)
-
-        # context ring + feathered boundary for blur-fill prompting
+        # Object-file MIL
+        parser.add_argument("--mil_enable", dest="mil_enable", action="store_true")
+        parser.add_argument("--no_mil", dest="mil_enable", action="store_false")
+        parser.set_defaults(mil_enable=True)
         parser.add_argument(
-            "--vm_ctx_ring_px",
+            "--mil_run_val",
+            dest="mil_run_val",
+            action="store_true",
+            help="Compute MIL/track losses on val/test (monitoring only; no EMA updates).",
+        )
+        parser.add_argument("--no_mil_run_val", dest="mil_run_val", action="store_false", help=argparse.SUPPRESS)
+        parser.set_defaults(mil_run_val=True)
+        parser.add_argument("--mil_lambda", type=float, default=0.10)
+        parser.add_argument("--mil_tau", type=float, default=0.05)
+        parser.add_argument("--mil_min_mask_area", type=float, default=0.01)
+
+        # SAM concept registry (optional)
+        # These flags are used by SAM-prepacked datasets and/or by the MIL
+        # losses to interpret concept IDs and apply frequency filtering.
+        _safe_add(
+            "--sam_prepacked_dir",
+            type=str,
+            default=None,
+            help="Path to SAM prepacked root (must contain concept_vocab.json).",
+        )
+        _safe_add(
+            "--sam_concept_frequency_json",
+            type=str,
+            default=None,
+            help="Optional path to concept_frequency.json (defaults to <sam_prepacked_dir>/concept_frequency.json).",
+        )
+        _safe_add(
+            "--sam_min_masks_per_concept",
             type=int,
             default=0,
-            help="Context ring width in pixels (at 224x224). 0 disables.",
+            help="If >0 and concept_frequency.json is available, drop SAM concepts with fewer than this many masks.",
         )
-        parser.add_argument(
-            "--vm_ctx_ring_strength",
-            type=float,
-            default=1.0,
-            help="Alpha for ring region (0..1). Only used if vm_ctx_ring_px > 0.",
+        _safe_add(
+            "--sam_concept_list_file",
+            type=str,
+            default=None,
+            help="Optional JSON file defining the global concept ID space (list or dict).",
         )
-        parser.add_argument(
-            "--vm_mask_feather_sigma",
+        _safe_add(
+            "--sam_weight_alpha",
             type=float,
             default=0.0,
-            help="Sigma for feathering the (object+ring) alpha boundary. 0 disables.",
+            help="Inverse-frequency reweighting exponent alpha (0 disables).",
         )
-        parser.add_argument(
-            "--vm_mask_feather_kernel",
-            type=int,
-            default=0,
-            help="Kernel size for feathering blur. 0 means auto from sigma.",
-        )
-
-        # regularizer on learnable local_weight to prevent collapsing toward 0 too fast
-        parser.add_argument(
-            "--vm_local_weight_reg_lambda",
-            type=float,
-            default=0.0,
-            help="Strength of (local_weight - init)^2 regularizer (with optional decay).",
-        )
-        parser.add_argument(
-            "--vm_local_weight_reg_decay_steps",
-            type=int,
-            default=0,
-            help="If >0, linearly decay the reg weight to 0 over this many steps.",
-        )
-
-        # usage-based VM weights (derived from per-slot usage_counts in VisualMemory)
-        parser.add_argument(
-            "--vm_enable_usage_reweighting",
-            dest="vm_enable_usage_reweighting",
+        _safe_add("--sam_weight_clip_min", type=float, default=0.25, help="Min clip for concept weights.")
+        _safe_add("--sam_weight_clip_max", type=float, default=4.0, help="Max clip for concept weights.")
+        _safe_add(
+            "--sam_use_concept_weights",
             action="store_true",
-            help="Enable inverse-frequency reweighting.",
+            help="If set, reweight MIL/coherence/GO losses by SAM concept frequency weights (approx. via best track).",
         )
-        parser.add_argument("--vm_usage_smoothing", type=float, default=1.0,
-                            help="additive smoothing for VM usage-based prototype weights")
-        parser.add_argument("--vm_usage_power", type=float, default=1.0,
-                            help="exponent for VM inverse-frequency prototype weights")
-        parser.add_argument("--vm_usage_min", type=float, default=0.33,
-                            help="lower clamp for VM usage-based prototype weights")
-        parser.add_argument("--vm_usage_max", type=float, default=3.0,
-                            help="upper clamp for VM usage-based prototype weights")
-
-        # object encoder fusion
-        parser.add_argument("--vm_local_weight", type=float, default=1.0,
-                            help="relative weight of local object feature in fusion")
-        parser.add_argument("--vm_learn_local_weight", action="store_true",
-                            help="learn the local/global mixing weight in object encoder")
-
-        # GradCAM logging flag used by MultiModalModel.encode_image
-        parser.add_argument(
-            "--vm_log_gradcam",
+        _safe_add(
+            "--sam_registry_verbose",
             action="store_true",
-            help="keep gradients on the conv feature map to enable GradCAM logging"
+            help="Print SAM registry summary on rank0.",
         )
 
-        # VM debugging
+        parser.add_argument("--mil_track", dest="mil_track", action="store_true")
+        parser.add_argument("--mil_no_track", dest="mil_track", action="store_false", help=argparse.SUPPRESS)
+        parser.set_defaults(mil_track=True)
+        parser.add_argument("--mil_track_sim_thresh", type=float, default=0.55)
+        parser.add_argument("--mil_track_max_tracks", type=int, default=16)
+
+        parser.add_argument("--mil_obj_ring_weight", type=float, default=0.05)
+        parser.add_argument("--mil_obj_ring_px_fmap", type=int, default=1)
+
+        # Patch fallback (when SAM masks vanish or are missing)
+        parser.add_argument("--mil_patch_topk", type=int, default=4, help="When a frame has no valid SAM masks, sample this many top patches from the feature map.")
+        parser.add_argument("--mil_patch_radius", type=int, default=1, help="Radius (in feature-map cells) for averaging around a sampled patch location.")
+
+
+        # MIL text query mode (sentence vs nouns)
         parser.add_argument(
-            "--vm_debug_verbose",
+            "--mil_text_mode",
+            type=str,
+            default="sentence",
+            choices=["sentence", "noun_avg", "noun_multi"],
+            help="Text representation for MIL losses: sentence embedding, averaged nouns, or multi-noun queries (t2i only).",
+        )
+        parser.add_argument("--mil_noun_max", type=int, default=5, help="Max #nouns per sample for noun-based MIL.")
+        parser.add_argument("--mil_noun_min_chars", type=int, default=2, help="Minimum #characters for a noun token to be kept.")
+        parser.add_argument("--mil_noun_use_lemma", dest="mil_noun_use_lemma", action="store_true", help="Use spaCy lemma for noun tokens (default).")
+        parser.add_argument("--mil_noun_no_lemma", dest="mil_noun_use_lemma", action="store_false", help=argparse.SUPPRESS)
+        parser.set_defaults(mil_noun_use_lemma=True)
+        parser.add_argument("--mil_noun_keep_propn", dest="mil_noun_keep_propn", action="store_true", help="Keep proper nouns (PROPN) as nouns (default).")
+        parser.add_argument("--mil_noun_drop_propn", dest="mil_noun_keep_propn", action="store_false", help=argparse.SUPPRESS)
+        parser.set_defaults(mil_noun_keep_propn=True)
+        parser.add_argument(
+            "--mil_noun_vocab_only",
+            dest="mil_noun_vocab_only",
             action="store_true",
-            help="print verbose visual memory debug info for the first few steps",
+            help="Keep only nouns present in vocab (avoid collapsing to <unk>). (default)",
         )
+        parser.add_argument("--mil_noun_allow_unk", dest="mil_noun_vocab_only", action="store_false", help=argparse.SUPPRESS)
+        parser.set_defaults(mil_noun_vocab_only=True)
+        parser.add_argument("--mil_noun_dedup", dest="mil_noun_dedup", action="store_true", help="Deduplicate nouns within a sentence (default).")
+        parser.add_argument("--mil_noun_no_dedup", dest="mil_noun_dedup", action="store_false", help=argparse.SUPPRESS)
+        parser.set_defaults(mil_noun_dedup=True)
+
+        # Pivot C: align SAM-mask embeddings to their SAM concept names (optional)
         parser.add_argument(
-            "--vm_debug_log_images_every",
-            type=int,
-           default=0,
-            help="if >0, log SAM mask overlays every N training steps",
+            "--sam_concept_align_enable",
+            action="store_true",
+            help="Auxiliary loss: classify SAM-mask embeddings by their concept names (object->concept InfoNCE over batch-unique concepts).",
         )
+        parser.add_argument("--sam_concept_align_lambda", type=float, default=0.05)
+        parser.add_argument("--sam_concept_align_tau", type=float, default=0.07)
 
-        # legacy VM flags kept for CLI compatibility (no effect in object-centric VM)
-        parser.add_argument("--vm_top_p", type=float, default=0.20,
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_use_masked_for_loss", action="store_true",
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_blend_alpha", type=float, default=0.20,
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_ema_alpha", type=float, default=0.20,
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_merge_sim", type=float, default=0.70,
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_debiased", action="store_true",
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_edge_prior", action="store_true",
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_edge_blend", type=float, default=0.35,
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_loss_mode", type=str, default="proto_nce",
-                            choices=["proto_nce", "supcon"],
-                            help=argparse.SUPPRESS)
-        parser.add_argument("--vm_use_edges", action="store_true",
-                            help=argparse.SUPPRESS)
+        # w_align gating
+        parser.add_argument("--w_align_sim0", type=float, default=0.10)
+        parser.add_argument("--w_align_simscale", type=float, default=0.05)
+        parser.add_argument("--w_align_warmup_steps", type=int, default=500)
+        parser.add_argument("--w_align_min", type=float, default=0.05)
 
-        # defaults for boolean flags that should be on by default
-        parser.set_defaults(vm_temporal=True)
-        parser.set_defaults(vm_use_sinkhorn=True)
-        parser.set_defaults(vm_temp_same_concept_only=True)
-        parser.set_defaults(vm_temp_detach_target=True)
+        # Track coherence
+        parser.add_argument("--track_coh_enable", dest="track_coh_enable", action="store_true")
+        parser.add_argument("--no_track_coh", dest="track_coh_enable", action="store_false")
+        parser.set_defaults(track_coh_enable=True)
+        parser.add_argument("--track_coh_lambda", type=float, default=0.05)
+        parser.add_argument("--track_coh_match_thresh", type=float, default=0.30)
+        parser.add_argument("--track_coh_min_frames", type=int, default=2)
+
+        # Global-object agreement
+        parser.add_argument("--go_enable", dest="go_enable", action="store_true")
+        parser.add_argument("--no_go", dest="go_enable", action="store_false")
+        parser.set_defaults(go_enable=True)
+        parser.add_argument("--go_lambda", type=float, default=0.05)
+
+        # Prototype memory
+        # NOTE: embedding_dim is typically defined elsewhere in the codebase (e.g. model args).
+        # When train.py composes multiple argparse groups, re-adding the same option string
+        # raises an argparse.ArgumentError. We therefore add it only if it doesn't already exist.
+        try:
+            parser.add_argument("--embedding_dim", type=int, default=128)
+        except argparse.ArgumentError:  # already registered by another group
+            pass
+        parser.add_argument("--proto_enable", dest="proto_enable", action="store_true")
+        parser.add_argument("--no_proto", dest="proto_enable", action="store_false")
+        parser.set_defaults(proto_enable=True)
+        parser.add_argument("--proto_num", type=int, default=64)
+        parser.add_argument("--proto_tau", type=float, default=0.07)
+
+        parser.add_argument("--proto_use_sinkhorn", dest="proto_use_sinkhorn", action="store_true")
+        parser.add_argument("--proto_no_sinkhorn", dest="proto_use_sinkhorn", action="store_false")
+        parser.set_defaults(proto_use_sinkhorn=True)
+        parser.add_argument("--proto_sinkhorn_iters", type=int, default=3)
+        parser.add_argument("--proto_sinkhorn_epsilon", type=float, default=0.05)
+        parser.add_argument("--proto_sinkhorn_min_samples", type=int, default=32)
+        parser.add_argument("--proto_ema_decay", type=float, default=0.99)
+        parser.add_argument("--proto_ema_eps", type=float, default=1e-3)
+        parser.add_argument("--proto_ema_ddp_sync", dest="proto_ema_ddp_sync", action="store_true")
+        parser.add_argument("--proto_ema_no_ddp_sync", dest="proto_ema_ddp_sync", action="store_false")
+        parser.set_defaults(proto_ema_ddp_sync=True)
+
+        # Warm start
+        parser.add_argument("--proto_warm_start", action="store_true")
+        parser.add_argument("--proto_no_warm_start", dest="proto_warm_start", action="store_false")
+        parser.set_defaults(proto_warm_start=True)
+        parser.add_argument("--proto_warm_min_local", type=int, default=128)
+        parser.add_argument("--proto_warm_sim_thresh", type=float, default=0.25)
+        parser.add_argument("--proto_warm_max_total", type=int, default=4096)
+        parser.add_argument("--proto_warm_kmeans_iters", type=int, default=10)
+
+        # Adapter
+        parser.add_argument("--img_adapter_enable", dest="img_adapter_enable", action="store_true")
+        parser.add_argument("--no_img_adapter", dest="img_adapter_enable", action="store_false")
+        parser.set_defaults(img_adapter_enable=True)
+
+        # Debug
+        parser.add_argument("--debug_save_tracks", action="store_true")
+        parser.add_argument("--debug_tracks_topk", type=int, default=6)
+        parser.add_argument("--debug_tracks_every_n_epochs", type=int, default=10)
+        parser.add_argument("--debug_tracks_overlay_alpha", type=float, default=0.45)
 
         return parser
 
+    # ------------------------------------------------------------------
+    # Optim
+    # ------------------------------------------------------------------
     def configure_optimizers(self):
+        decay, no_decay = [], []
+        for name, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            name_l = name.lower()
+            # Don't decay biases / normalization params.
+            # Also keep small auxiliary params (null track, adapter) out of weight decay by default.
+            if (
+                name.endswith(".bias")
+                or "bn" in name_l
+                or "ln" in name_l
+                or "norm" in name_l
+                or name == "null_obj"
+                or name_l.startswith("img_adapter")
+            ):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+
         optimizer = self.optimizer_class(
-            self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+            [{"params": decay, "weight_decay": self.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
+            lr=self.lr,
+        )
+
         if not self.lr_scheduler:
             return optimizer
-        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            factor=self.factor,
-            patience=self.patience,
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": lr_scheduler,
-                "monitor": "val/loss",
-            }
-        }
 
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, factor=self.factor, patience=self.patience
+        )
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": lr_scheduler, "monitor": "val/infonce_loss"}}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def forward(self, x, y, y_len):
         return self.model(x, y, y_len)
 
     @staticmethod
-    def load_model(model_name="cvcl"):
-        """Load pre-trained CVCL model from HuggingFace Hub"""
+    def load_model(model_name: str = "cvcl"):
         if model_name == "cvcl":
             checkpoint_name = "cvcl_s_dino_resnext50_embedding"
-            checkpoint = hf_hub_download(
-                repo_id="wkvong/" + checkpoint_name,
-                filename=checkpoint_name + ".ckpt"
-            )
+            checkpoint = hf_hub_download(repo_id="wkvong/" + checkpoint_name, filename=checkpoint_name + ".ckpt")
             model = MultiModalLitModel.load_from_checkpoint(checkpoint_path=checkpoint)
         else:
             raise ValueError("Model name not found.")
 
-        preprocess = transforms.Compose([
-            transforms.Resize((224, 224),
-                              interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                [0.485, 0.456, 0.406],
-                [0.229, 0.224, 0.225]
-            )
-        ])
-
+        preprocess = transforms.Compose(
+            [
+                transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
         return model, preprocess
 
-    def encode_image(self, x):
-        """Encode images to obtain image features"""
+    def encode_image(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode images to obtain image features."""
+
         image_features, _ = self.model.encode_image(x)
         return image_features
 
-    def encode_text(self, y, y_len=None):
-        """Encode text to obtain text features"""
+    def encode_text(self, y: torch.Tensor, y_len: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Encode text to obtain text features."""
+
         text_features, _ = self.model.encode_text(y, y_len)
         return text_features
 
     def tokenize(self, texts):
-        """Tokenize texts to obtain tokens and token lengths"""
-        max_seq_len = 25
+        """Tokenize texts to obtain tokens and token lengths."""
 
+        max_seq_len = 25
         if isinstance(texts, str):
             texts = [texts]
-
         all_tokens = []
         token_lengths = []
-
         for text in texts:
             doc = self.nlp(text)
             word_tokens = [token.text for token in doc]
-
             if len(word_tokens) > max_seq_len - 2:
-                word_tokens = word_tokens[:max_seq_len - 2]
-
-            token_length = len(word_tokens) + 2  # +2 for <sos> and <eos>
-
-            tokens = [self.vocab["<sos>"]] + [
-                self.vocab.get(token, self.vocab["<unk>"]) for token in word_tokens
-            ] + [self.vocab["<eos>"]] + [
-                self.vocab["<pad>"]
-            ] * (max_seq_len - len(word_tokens) - 2)
-
+                word_tokens = word_tokens[: max_seq_len - 2]
+            token_length = len(word_tokens) + 2
+            tokens = (
+                [self.vocab["<sos>"]]
+                + [self.vocab.get(token, self.vocab["<unk>"]) for token in word_tokens]
+                + [self.vocab["<eos>"]]
+                + [self.vocab["<pad>"]] * (max_seq_len - len(word_tokens) - 2)
+            )
             all_tokens.append(tokens)
             token_lengths.append(token_length)
-
         tokens = torch.tensor(all_tokens, dtype=torch.long)
         token_lengths = torch.tensor(token_lengths, dtype=torch.long)
         return tokens, token_lengths
 
+
+    @staticmethod
+    def _raw_to_text(raw) -> str:
+        """Best-effort conversion of dataset raw_y element to a single string."""
+        if raw is None:
+            return ""
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, (list, tuple)):
+            # common case: ["utterance"] or [ref1, ref2, ...]
+            parts = []
+            for r in raw:
+                if isinstance(r, str):
+                    parts.append(r)
+                elif isinstance(r, (list, tuple)) and len(r) > 0 and isinstance(r[0], str):
+                    parts.append(r[0])
+                else:
+                    try:
+                        parts.append(str(r))
+                    except Exception:
+                        pass
+            return " ".join([p for p in parts if p])
+        try:
+            return str(raw)
+        except Exception:
+            return ""
+
+    def _extract_nouns(self, text: str) -> List[str]:
+        """Extract a small list of noun-like tokens from a caption using spaCy POS tags."""
+        if text is None:
+            return []
+        key = text.strip().lower()
+        if not key:
+            return []
+
+        cached = self._noun_cache.get(key)
+        if cached is not None:
+            return list(cached)
+
+        doc = self.nlp(key)
+        out: List[str] = []
+        seen = set()
+        for tok in doc:
+            if tok.is_space or tok.is_punct or tok.like_num:
+                continue
+            if tok.is_stop:
+                continue
+            pos = tok.pos_
+            if pos == "NOUN" or (self.mil_noun_keep_propn and pos == "PROPN"):
+                w = tok.lemma_.lower() if self.mil_noun_use_lemma else tok.text.lower()
+                w = w.strip()
+                if len(w) < self.mil_noun_min_chars:
+                    continue
+                if self.mil_noun_vocab_only and (w not in self.vocab):
+                    continue
+                if self.mil_noun_dedup:
+                    if w in seen:
+                        continue
+                    seen.add(w)
+                out.append(w)
+                if len(out) >= self.mil_noun_max:
+                    break
+
+        # cache
+        self._noun_cache[key] = tuple(out)
+        if len(self._noun_cache) > self._noun_cache_max:
+            self._noun_cache.clear()
+        return out
+
+    def _tokenize_phrases(self, phrases: List[str], *, max_seq_len: int = 25) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize a list of short phrases using the loaded vocab (no spaCy tokenization).
+
+        Returns:
+            tokens: (N, max_seq_len) LongTensor
+            lengths: (N,) LongTensor (includes <sos>, <eos>)
+        """
+        pad = int(self.vocab.get("<pad>", PAD_TOKEN_ID))
+        sos = int(self.vocab.get("<sos>", SOS_TOKEN_ID))
+        eos = int(self.vocab.get("<eos>", EOS_TOKEN_ID))
+        unk = int(self.vocab.get("<unk>", UNK_TOKEN_ID))
+
+        seqs: List[List[int]] = []
+        lens: List[int] = []
+        for phrase in phrases:
+            key = (phrase or "").strip().lower()
+            if key in self._phrase_token_cache:
+                seq, ln = self._phrase_token_cache[key]
+                seqs.append(list(seq))
+                lens.append(int(ln))
+                continue
+
+            words = [w for w in re.split(r"\s+", key) if w]
+            ids = [self.vocab.get(w, unk) for w in words][: max_seq_len - 2]
+            seq = [sos] + ids + [eos]
+            ln = len(seq)
+            if ln < max_seq_len:
+                seq = seq + [pad] * (max_seq_len - ln)
+            else:
+                seq = seq[:max_seq_len]
+                ln = max_seq_len
+
+            self._phrase_token_cache[key] = (tuple(seq), ln)
+            seqs.append(seq)
+            lens.append(ln)
+
+        tokens = torch.tensor(seqs, dtype=torch.long)
+        lengths = torch.tensor(lens, dtype=torch.long)
+        return tokens, lengths
+
+    def _encode_phrases(self, phrases: List[str], *, device: torch.device) -> torch.Tensor:
+        """Encode short phrases to normalized text embeddings."""
+        if len(phrases) == 0:
+            # caller should handle empties
+            return torch.empty((0, int(self.proj_dim)), device=device)
+        tok, tok_len = self._tokenize_phrases(phrases, max_seq_len=25)
+        tok = tok.to(device)
+        tok_len = tok_len.to(device)
+        feat, _ = self.model.encode_text(tok, tok_len)
+        return l2norm_obj(feat.float())
+
+    def _noun_features_from_raw_y(
+        self,
+        raw_y,
+        *,
+        B: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract up to N nouns per sample and return (B,N,D) features + validity mask."""
+        Nn = max(1, int(self.mil_noun_max))
+        feat = torch.zeros((B, Nn, int(self.proj_dim)), device=device)
+        valid = torch.zeros((B, Nn), dtype=torch.bool, device=device)
+        count = torch.zeros((B,), dtype=torch.long, device=device)
+
+        if raw_y is None:
+            return feat, valid, count
+
+        # raw_y is typically a list (len B) of ["caption"]
+        phrases = []
+        ij = []
+        for i in range(B):
+            try:
+                raw_i = raw_y[i]
+            except Exception:
+                raw_i = raw_y
+            text = self._raw_to_text(raw_i)
+            nouns = self._extract_nouns(text)
+            if len(nouns) == 0:
+                continue
+            nouns = nouns[:Nn]
+            count[i] = len(nouns)
+            for j, w in enumerate(nouns):
+                phrases.append(w)
+                ij.append((i, j))
+
+        if len(phrases) == 0:
+            return feat, valid, count
+
+        emb = self._encode_phrases(phrases, device=device)  # (L,D)
+        i_idx = torch.tensor([p[0] for p in ij], device=device, dtype=torch.long)
+        j_idx = torch.tensor([p[1] for p in ij], device=device, dtype=torch.long)
+
+        feat = feat.index_put((i_idx, j_idx), emb)
+        valid = valid.index_put((i_idx, j_idx), torch.ones(len(ij), device=device, dtype=torch.bool))
+        return feat, valid, count
+
+    # ------------------------------------------------------------------
+    # Batch parsing
+    # ------------------------------------------------------------------
     def _split_batch(self, batch):
-        """
-        Accept batches in one of three shapes:
-        1) (x, y, y_len, raw_y)
-        2) (x, y, y_len, raw_y, meta)
-        3) ((x, y, y_len, raw_y), meta)
-        Returns (x, y, y_len, raw_y, meta_or_None).
-        """
         if isinstance(batch, (list, tuple)):
             if len(batch) == 2 and isinstance(batch[0], (list, tuple)) and len(batch[0]) == 4:
                 (x, y, y_len, raw_y), meta = batch
@@ -1138,664 +955,1502 @@ class MultiModalLitModel(pl.LightningModule):
                 x, y, y_len, raw_y = batch
                 return x, y, y_len, raw_y, None
         raise ValueError(
-            f"Unexpected batch structure: type={type(batch)} len={len(batch) if isinstance(batch, (list, tuple)) else 'n/a'}"
+            f"Unexpected batch structure: type={type(batch)} "
+            f"len={len(batch) if isinstance(batch, (list, tuple)) else 'n/a'}"
         )
 
+    # ------------------------------------------------------------------
+    # DDP safety (avoid `find_unused_parameters` requirement)
+    # ------------------------------------------------------------------
+    def _ddp_is_active(self) -> bool:
+        try:
+            return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        except Exception:
+            return False
+
+    def _ddp_find_unused_parameters_enabled(self) -> bool:
+        """Return True if the PL strategy is configured with find_unused_parameters=True."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return False
+        strat = getattr(trainer, "strategy", None)
+        if strat is None:
+            return False
+        fup = getattr(strat, "find_unused_parameters", None)
+        return bool(fup) if fup is not None else False
+
+    def _tie_params_if_needed(self, loss: torch.Tensor, params: List[torch.Tensor]) -> torch.Tensor:
+        """If DDP is active and find_unused_parameters=False, tie params into the graph via 0-weight sums."""
+        if self._ddp_is_active() and (not self._ddp_find_unused_parameters_enabled()):
+            tie = loss.new_tensor(0.0)
+            for p in params:
+                if p is None:
+                    continue
+                if torch.is_tensor(p) and p.requires_grad:
+                    tie = tie + 0.0 * p.sum()
+            return loss + tie
+        return loss
+
+    def _tie_module_params_if_needed(self, loss: torch.Tensor, module: nn.Module) -> torch.Tensor:
+        if not (self._ddp_is_active() and (not self._ddp_find_unused_parameters_enabled())):
+            return loss
+        tie = loss.new_tensor(0.0)
+        for p in module.parameters():
+            if p.requires_grad:
+                tie = tie + 0.0 * p.sum()
+        return loss + tie
+
+    # ------------------------------------------------------------------
+    # LM helpers
+    # ------------------------------------------------------------------
     def calculate_ce_loss(
-        self, y, y_len, x=None,
+        self,
+        y,
+        y_len,
+        x=None,
         outputs=None,
         image_features=None,
         image_feature_map=None,
         return_image_features=False,
-        **kwargs
+        **kwargs,
     ):
-        """Wraps self.language_model.calculate_ce_loss."""
-        if self.language_model.text_encoder.captioning or \
-                self.language_model.text_encoder.has_attention:
-            # get image_features and image_feature_map if needed
+        # If captioning or attention is enabled, we must provide image features/maps and cannot reuse outputs.
+        if self.language_model.text_encoder.captioning or self.language_model.text_encoder.has_attention:
             if image_features is None:
                 image_features, image_feature_map = self.model.encode_image(x)
-            # text_outputs is not reusable since it is not obtained from
-            # captioning in the contrastive module
             outputs = None
         else:
             image_features, image_feature_map = None, None
 
-        # calculate language model ce loss
         ret = self.language_model.calculate_ce_loss(
-            y, y_len,
+            y,
+            y_len,
             outputs=outputs,
-            image_features=image_features
-                if self.language_model.text_encoder.captioning else None,
-            image_feature_map=image_feature_map
-                if self.language_model.text_encoder.has_attention else None,
-            **kwargs
+            image_features=image_features if self.language_model.text_encoder.captioning else None,
+            image_feature_map=image_feature_map if self.language_model.text_encoder.has_attention else None,
+            **kwargs,
         )
         if return_image_features:
             ret = ret + (image_features, image_feature_map)
         return ret
 
-    def build_vm_inputs_from_batch(
+    # ------------------------------------------------------------------
+    # MIL helpers: keep BatchNorm stable during extra forwards
+    # ------------------------------------------------------------------
+    @contextmanager
+    def _vision_backbone_eval_for_mil(self):
+        """Temporarily set ONLY the vision backbone module to eval(), then restore."""
+
+        ve = getattr(self.model, "image_embed", None)
+        backbone = getattr(ve, "model", None) if ve is not None else None
+        if backbone is None:
+            yield
+            return
+
+        was_training = backbone.training
+        backbone.eval()
+        try:
+            yield
+        finally:
+            backbone.train(was_training)
+
+    def _get_layer4_fmap(self, x_flat: torch.Tensor) -> torch.Tensor:
+        """Extract a layer4 feature map (N,C4,H4,W4). Falls back to encode_image's fmap if needed."""
+
+        ve = getattr(self.model, "image_embed", None)
+        if ve is None:
+            raise RuntimeError("Model is missing image_embed; cannot compute fmap.")
+
+        # Preferred path: CNN ResNet/ResNeXt with forward_to_layer3.
+        backbone = getattr(ve, "model", None)
+        if hasattr(ve, "forward_to_layer3") and backbone is not None and hasattr(backbone, "layer4"):
+            with self._vision_backbone_eval_for_mil():
+                with torch.no_grad():
+                    f3 = ve.forward_to_layer3(x_flat)
+                    fmap4 = backbone.layer4(f3)
+            return fmap4.detach()
+
+        # Fallback path: use encode_image feature map.
+        with torch.no_grad():
+            _g, fmap = self.model.encode_image(x_flat)
+        if fmap is None:
+            raise RuntimeError("encode_image did not return a feature map; cannot pool masks.")
+        return fmap.detach()
+
+    def _pool_object_embeddings_from_layer4(
         self,
-        batch,
-        device=None,
-    ):
+        *,
+        fmap4: torch.Tensor,  # (N,C4,H4,W4)
+        masks_img: torch.Tensor,  # (N,K,1,H,W) float
+        valid: torch.Tensor,  # (N,K) bool
+    ) -> torch.Tensor:
+        """Pool mask embeddings on layer4 fmap and project with backbone.fc into embedding space."""
+
+        device = fmap4.device
+        N, C4, H4, W4 = fmap4.shape
+        Nk, K, _, H, W = masks_img.shape
+        if Nk != N:
+            raise ValueError(f"masks_img N mismatch: fmap4 N={N}, masks N={Nk}")
+        if K == 0 or N == 0:
+            return torch.empty((N, 0, self.embedding_dim), device=device, dtype=torch.float32)
+
+        # Downsample masks to fmap resolution using area to preserve silhouette mass.
+        masks_ds = F.interpolate(
+            masks_img.view(N * K, 1, H, W).float(),
+            size=(H4, W4),
+            mode="area",
+        ).view(N, K, 1, H4, W4)
+        masks_ds = masks_ds.clamp(0.0, 1.0)
+
+        # Optional context ring in fmap space.
+        if self.mil_obj_ring_weight > 0.0 and self.mil_obj_ring_px_fmap > 0:
+            ring = context_ring_masks((masks_ds > 0.0).float(), ring_px=int(self.mil_obj_ring_px_fmap))
+            masks_w = (masks_ds + float(self.mil_obj_ring_weight) * ring).clamp(0.0, 1.0)
+        else:
+            masks_w = masks_ds
+
+        pooled = masked_pool_k(fmap4, masks_w, eps=1e-6)  # (N,K,C4)
+
+        # Project pooled C4 vectors using the existing backbone head into embedding space.
+        ve = getattr(self.model, "image_embed", None)
+        backbone = getattr(ve, "model", None) if ve is not None else None
+        proj = getattr(backbone, "fc", None) if backbone is not None else None
+        if proj is None:
+            raise RuntimeError("Backbone has no .fc; cannot project pooled layer4 vectors.")
+
+        z = proj(pooled.reshape(N * K, C4)).view(N, K, -1).float()  # (N,K,D)
+        z = l2norm_obj(z)
+        return z
+
+    def _get_bag_tensors(
+        self,
+        x: torch.Tensor,
+        meta: Optional[dict],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return bagged images + optional SAM masks.
+
+        Returns:
+          x_bag: (B,M,3,H,W)
+          sam_mask: optional (B,M,K,1,H,W)
+          sam_concept: optional (B,M,K) concept IDs (local or global)
         """
-        Rebuild object appearance embeddings and metadata from a dataloader batch.
 
-        Returns None if there are no valid SAM masks in the batch.
+        if x.ndim == 4:
+            x_bag = x.unsqueeze(1)
+        elif x.ndim == 5:
+            x_bag = x
+        else:
+            raise ValueError(f"Expected x 4D or 5D, got {tuple(x.shape)}")
 
-        Output dict has:
-            "embeds":        (N_obj, D_vm)
-            "concept_ids":   (N_obj,)
-            "clip_id":       (N_obj,)  long (hashed clip ids)
-            "frame_idx":     (N_obj,)  long
-            "frame_relpath": list[str] of length N_obj
+        sam_mask = None
+        sam_concept = None
+        if meta is not None and isinstance(meta, dict):
+            sam_mask = meta.get("sam_mask", None)
+
+            # Optional concept ids per mask slot.
+            # We accept several key aliases since different dataset pipelines
+            # use different names.
+            for k in (
+                "sam_concept",
+                "sam_concept_ids",
+                "sam_concept_id",
+                "sam_mask_concept",
+                "sam_mask_concept_ids",
+                "sam_mask_concept_id",
+                "sam_local_concept_ids",
+                "sam_global_concept_ids",
+            ):
+                if k in meta:
+                    sam_concept = meta.get(k)
+                    break
+
+        return x_bag, sam_mask, sam_concept
+
+
+
+    def _compute_frame_candidates(
+        self,
+        *,
+        x_bag: torch.Tensor,  # (B,M,3,H,W)
+        sam_mask: Optional[torch.Tensor],  # (B,M,K,1,H,W)
+        sam_count: Optional[torch.Tensor],
+        sam_concept: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor,  # z_bmkd (B,M,K,D)
+        torch.Tensor,  # valid_bmk (B,M,K)
+        Optional[torch.Tensor],  # masks_bmkhw (B,M,K,H,W) or None
+        Optional[torch.Tensor],  # concept_gid_bmk (B,M,K) or None
+        Dict[str, Any],  # cand_meta
+    ]:
+        """Compute per-frame candidate embeddings from SAM masks (with patch fallback).
+
+        We pool candidate embeddings from SAM masks on a layer4 feature map.
+
+        Fallbacks:
+          1) If a mask is valid at image resolution but becomes empty after
+             downsampling to feature-map resolution, sample a patch embedding
+             at the mask centroid (avg-pooled over a small neighborhood).
+          2) If a frame ends up with *no* valid candidates (no masks / all
+             filtered), sample top-k patch embeddings from the feature map.
+
+        Returns:
+          z_bmkd: (B,M,K,D)
+          valid_bmk: (B,M,K) bool
+          masks_bmkhw: (B,M,K,H,W) float (for debugging/vis) or None
+          concept_gid_bmk: optional (B,M,K) global concept IDs (or None)
+          cand_meta: dict with:
+              - is_patch: (B,M,K) bool (True if candidate is patch-derived)
+              - is_vanish_patch: (B,M,K) bool (patch from vanished downsampled mask)
+              - is_topk_patch: (B,M,K) bool (patch from top-k fallback due to no masks)
+              - patch_py/patch_px: (B,M,K) long feature-map coords (or -1)
+              - Hf/Wf: feature-map spatial size (ints)
         """
-        if device is None:
-            device = next(self.parameters()).device
 
-        # Use the same batch splitter as in training
-        images, utt_idxs, utt_lens, raw_y, meta = self._split_batch(batch)
-        x = images.to(device)
+        device = x_bag.device
+        B, M, C, H, W = x_bag.shape
 
-        if not isinstance(meta, dict):
-            return None
-        if "sam_mask" not in meta or "sam_mask_concept_id" not in meta:
-            return None
+        # Helper: get projection head (C4 -> D) used by the backbone
+        ve = getattr(self.model, "image_embed", None)
+        backbone = getattr(ve, "model", None) if ve is not None else None
+        proj = getattr(backbone, "fc", None) if backbone is not None else None
+        if proj is None:
+            raise RuntimeError("Backbone has no .fc; cannot project patch vectors.")
 
-        sam_mask = meta["sam_mask"].to(device)           # (B, K, 1, H, W)
-        sam_cid  = meta["sam_mask_concept_id"].to(device)  # (B, K)
-
-        B, K, _, H, W = sam_mask.shape
-
-        # ---- flatten masks and concepts ----
-        sam_mask_flat = sam_mask.view(B * K, 1, H, W)    # (B*K, 1, H, W)
-        cid_flat      = sam_cid.view(B * K)              # (B*K,)
-
-        valid = cid_flat >= 0
-        if valid.sum() == 0:
-            return None
-
-        # broadcast images to match masks
-        x_exp  = x.unsqueeze(1).expand(-1, K, -1, -1, -1)    # (B, K, C, H, W)
-        x_flat = x_exp.reshape(B * K, x.size(1), H, W)       # (B*K, C, H, W)
-
-        x_valid     = x_flat[valid]                          # (N_obj, C, H, W)
-        masks_valid = sam_mask_flat[valid]                   # (N_obj, 1, H, W)
-        cids_valid  = cid_flat[valid]                        # (N_obj,)
-
-        # ---- masked RGB with blurred background fill (match training) ----
-        blur_ksize = int(self.args.get("vm_bg_blur_kernel", 23))
-        blur_sigma = float(self.args.get("vm_bg_blur_sigma", 5.0))
-
-        x_blur = gaussian_blur2d(x, kernel_size=blur_ksize, sigma=blur_sigma)  # (B,3,H,W)
-        x_blur_exp = x_blur.unsqueeze(1).expand(-1, K, -1, -1, -1).reshape(B * K, x.size(1), H, W)
-        x_bg_valid = x_blur_exp[valid]  # (N_obj,3,H,W)
-
-        ring_px = int(self.args.get("vm_ctx_ring_px", 0))
-        ring_strength = float(self.args.get("vm_ctx_ring_strength", 1.0))
-        feather_sigma = float(self.args.get("vm_mask_feather_sigma", 0.0))
-        feather_kernel = int(self.args.get("vm_mask_feather_kernel", 0))
-        feather_kernel = None if feather_kernel <= 0 else feather_kernel
-
-        alpha_mask = make_context_alpha(
-            masks_valid,
-            ring_px=ring_px,
-            ring_strength=ring_strength,
-            feather_sigma=feather_sigma,
-            feather_kernel=feather_kernel,
-        )
-
-        x_masked = x_valid * alpha_mask + x_bg_valid * (1.0 - alpha_mask)
-
-        # encode masked patches with the same path as training
-        with torch.no_grad():
-            obj_global_feat, obj_fmap = self.model.encode_image(x_masked)
-
-        if obj_fmap is None:
-            return None
-
-        N_obj, Cf, Hf, Wf = obj_fmap.shape
-
-        # downsample masks to feature map size
-        masks_ds = torch.nn.functional.interpolate(
-            masks_valid,
-            size=(Hf, Wf),
-            mode="nearest",
-        )  # (N_obj, 1, Hf, Wf)
-
-        # local feature by masked spatial pooling
-        obj_local_feat = masked_spatial_pool(obj_fmap, masks_ds)  # (N_obj, Cf)
-
-        # ---- visual memory appearance encoder (reuse training obj_encoder) ----
-        if self.obj_encoder is None:
-            self.obj_encoder = ObjectAppearanceEncoder(
-                dim_global=obj_global_feat.size(-1),
-                dim_local=obj_local_feat.size(-1),
-                dim_out=self.vm_obj_out_dim,
-                use_local=True,
-                local_weight=float(self.args.get("vm_local_weight", 1.0)),
-                learn_local_weight=bool(self.args.get("vm_learn_local_weight", False)),
-            ).to(device)
-
-        with torch.no_grad():
-            embeds = self.obj_encoder(
-                global_feat=obj_global_feat,
-                local_feat=obj_local_feat,
-            )  # (N_obj, D_vm)
+        # Helper: build an avg-pooled fmap for patch sampling
+        def _avgpool_fmap(fmap4: torch.Tensor) -> torch.Tensor:
+            r = max(int(getattr(self, "mil_patch_radius", 1)), 0)
+            if r <= 0:
+                return fmap4
+            k = 2 * r + 1
+            return F.avg_pool2d(fmap4, kernel_size=k, stride=1, padding=r)
 
         # ------------------------------------------------------------------
-        # Temporal metadata: clip_id, frame_idx, frame_filename
+        # If there are no SAM masks at all, fall back to patch-only candidates.
         # ------------------------------------------------------------------
-        clip_raw  = meta.get("clip_id", None)
-        frame_raw = meta.get("frame_idx", None)
+        if sam_mask is None or (torch.is_tensor(sam_mask) and int(sam_mask.size(2)) == 0):
+            if B == 0 or M == 0:
+                z = torch.empty((B, M, 0, self.embedding_dim), device=device, dtype=torch.float32)
+                v = torch.zeros((B, M, 0), device=device, dtype=torch.bool)
+                meta = {"is_patch": v, "is_vanish_patch": v, "is_topk_patch": v, "patch_py": v.long(), "patch_px": v.long(), "Hf": 0, "Wf": 0}
+                return z, v, None, None, meta
 
-        # clip ids may be strings; follow the training code and hash to numeric ids
-        if clip_raw is None:
-            clip_ids_valid = torch.zeros_like(cids_valid, dtype=torch.long, device=device)
-        else:
-            if isinstance(clip_raw, torch.Tensor):
-                clip_ids_list = clip_raw.tolist()
-            else:
-                clip_ids_list = list(clip_raw)
+            N = B * M
+            x_flat = x_bag.reshape(N, C, H, W)
+            fmap4 = self._get_layer4_fmap(x_flat)  # (N,C4,H4,W4) detached
+            Nf, C4, H4, W4 = fmap4.shape
+            if Nf != N:
+                raise ValueError(f"Unexpected fmap N={Nf} for N={N}")
 
-            clip_ids_numeric = [
-                abs(hash(c)) % (1 << 31) if isinstance(c, str) else int(c)
-                for c in clip_ids_list
-            ]
-            clip_tensor = torch.as_tensor(
-                clip_ids_numeric, device=device, dtype=torch.long
-            )  # (B,)
-            clip_tensor = clip_tensor.view(B, 1).expand(-1, K).reshape(B * K)  # (B*K,)
-            clip_ids_valid = clip_tensor[valid].to(torch.long)                 # (N_obj,)
+            fmap_p = _avgpool_fmap(fmap4)
+            P = int(H4 * W4)
+            kfill = int(min(int(getattr(self, "mil_patch_topk", 4)), P))
+            kfill = max(kfill, 0)
 
-        # frame indices should already be numeric, but be defensive
-        if frame_raw is None:
-            frame_idx_valid = torch.zeros_like(cids_valid, dtype=torch.long, device=device)
-        else:
-            if isinstance(frame_raw, torch.Tensor):
-                frame_tensor = frame_raw.to(device)
-            else:
-                frame_tensor = torch.as_tensor(
-                    [int(f) for f in frame_raw], device=device, dtype=torch.long
-                )
-            frame_tensor = frame_tensor.view(B, 1).expand(-1, K).reshape(B * K)
-            frame_idx_valid = frame_tensor[valid].to(torch.long)
+            if kfill == 0:
+                z = torch.empty((B, M, 0, self.embedding_dim), device=device, dtype=torch.float32)
+                v = torch.zeros((B, M, 0), device=device, dtype=torch.bool)
+                meta = {"is_patch": v, "is_vanish_patch": v, "is_topk_patch": v, "patch_py": v.long(), "patch_px": v.long(), "Hf": int(H4), "Wf": int(W4)}
+                return z, v, None, None, meta
 
-        # frame-level identifier, for later visualization
-        if "frame_filename" in meta:
-            relpaths = meta["frame_filename"]
-        elif "img_relpath" in meta:
-            relpaths = meta["img_relpath"]
-        elif "image_relpath" in meta:
-            relpaths = meta["image_relpath"]
-        else:
-            relpaths = [""] * B
+            # Project all patch cells and pick top-k by embedding norm.
+            cells = fmap_p.permute(0, 2, 3, 1).reshape(N, P, C4)
+            z_cells = proj(cells.reshape(N * P, C4)).view(N, P, -1).float()  # (N,P,D)
+            score = z_cells.norm(dim=2)  # (N,P)
+            top_idx = torch.topk(score, k=kfill, dim=1, largest=True, sorted=True).indices  # (N,k)
 
-        if isinstance(relpaths, torch.Tensor):
-            relpaths = list(relpaths)
+            idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, z_cells.size(2))
+            z_top = torch.gather(z_cells, 1, idx_exp)  # (N,k,D)
+            z_top = l2norm_obj(z_top)
+            if self.img_adapter_enable:
+                z_top = l2norm_obj(self.img_adapter(z_top))
 
-        relpaths_per_obj: list[str] = []
-        valid_2d = valid.view(B, K)
-        for b in range(B):
-            rp_b = relpaths[b]
-            for k in range(K):
-                if valid_2d[b, k]:
-                    relpaths_per_obj.append(rp_b)
+            py = (top_idx // int(W4)).long()
+            px = (top_idx % int(W4)).long()
 
-        return {
-            "embeds": embeds,                    # (N_obj, D_vm)
-            "concept_ids": cids_valid,           # (N_obj,)
-            "clip_id": clip_ids_valid,           # (N_obj,)
-            "frame_idx": frame_idx_valid,        # (N_obj,)
-            "frame_relpath": relpaths_per_obj,   # list[str]
+            valid_flat = torch.ones((N, kfill), device=device, dtype=torch.bool)
+            is_topk = torch.ones((N, kfill), device=device, dtype=torch.bool)
+            is_vanish = torch.zeros_like(is_topk)
+            is_patch = is_topk
+
+            z_bmkd = z_top.view(B, M, kfill, -1)
+            valid_bmk = valid_flat.view(B, M, kfill)
+
+            cand_meta: Dict[str, Any] = {
+                "is_patch": is_patch.view(B, M, kfill),
+                "is_vanish_patch": is_vanish.view(B, M, kfill),
+                "is_topk_patch": is_topk.view(B, M, kfill),
+                "patch_py": py.view(B, M, kfill),
+                "patch_px": px.view(B, M, kfill),
+                "Hf": int(H4),
+                "Wf": int(W4),
+            }
+            return z_bmkd, valid_bmk, None, None, cand_meta
+
+        # ------------------------------------------------------------------
+        # SAM masks exist: pool them, then patch-fallback as needed.
+        # ------------------------------------------------------------------
+        if sam_mask.ndim != 6:
+            raise ValueError(f"Expected sam_mask (B,M,K,1,H,W), got {tuple(sam_mask.shape)}")
+
+        sam_mask = sam_mask.to(device=device, dtype=torch.float32)
+        Bm, Mm, K, _, Hm, Wm = sam_mask.shape
+        if Bm != B or Mm != M:
+            raise ValueError(f"Mask shape mismatch: x {tuple(x_bag.shape)}, mask {tuple(sam_mask.shape)}")
+
+        # Resize masks to image size if needed.
+        masks = sam_mask
+        if (Hm, Wm) != (H, W):
+            masks = F.interpolate(
+                masks.view(B * M * K, 1, Hm, Wm),
+                size=(H, W),
+                mode="area",
+            ).view(B, M, K, 1, H, W)
+
+        # Valid: non-empty AND above min area.
+        area = masks.sum(dim=(3, 4, 5))  # (B,M,K)
+        area_frac = area / float(H * W)
+        valid = area_frac >= float(self.mil_min_mask_area)
+
+        # Optional count mask: ignore padded slots k >= count.
+        if sam_count is not None and torch.is_tensor(sam_count):
+            cnt = sam_count.to(device=device, dtype=torch.long)
+            while cnt.ndim > 2:
+                cnt = cnt.squeeze(-1)
+            if cnt.ndim == 2 and cnt.shape[0] == B and cnt.shape[1] == M:
+                kk = torch.arange(K, device=device).view(1, 1, K)
+                valid = valid & (kk < cnt.unsqueeze(-1))
+
+        # Optional: map SAM concept IDs -> global IDs and apply registry filtering.
+        concept_gid_bmk: Optional[torch.Tensor] = None
+        if sam_concept is not None and torch.is_tensor(sam_concept) and K > 0:
+            cid = sam_concept.to(device=device, dtype=torch.long)
+            while cid.ndim > 3:
+                cid = cid.squeeze(-1)
+
+            if cid.ndim == 3 and cid.shape[0] == B and cid.shape[1] == M and cid.shape[2] == K:
+                if self.sam_registry is not None:
+                    ltg = self.sam_registry.local_to_global.to(device=device)
+                    local_C = int(ltg.numel())
+
+                    cid_nonneg = cid[cid >= 0]
+                    max_id = int(cid_nonneg.max().item()) if cid_nonneg.numel() > 0 else -1
+
+                    if max_id < local_C:
+                        in_range = (cid >= 0) & (cid < local_C)
+                        gid = torch.full_like(cid, -1)
+                        gid[in_range] = ltg[cid[in_range]]
+                        concept_gid_bmk = gid
+                        valid = valid & (concept_gid_bmk >= 0)
+                    else:
+                        gid = cid
+                        Cg = int(self.sam_registry.weights.numel())
+                        in_range = (gid >= 0) & (gid < Cg)
+                        gid = torch.where(in_range, gid, torch.full_like(gid, -1))
+                        concept_gid_bmk = gid
+
+                        do_freq_filter = (
+                            int(getattr(self.sam_registry, "min_masks_per_concept", 0)) > 0
+                            and float(self.sam_registry.counts_full.sum().item()) > 0.0
+                        )
+                        if do_freq_filter:
+                            keep = (self.sam_registry.counts_eff.to(device=device) > 0.0)
+                            keep_mask = (concept_gid_bmk >= 0) & keep[concept_gid_bmk.clamp(min=0)]
+                            valid = valid & keep_mask
+                else:
+                    concept_gid_bmk = cid
+
+        # Flatten and pool.
+        N = B * M
+        x_flat = x_bag.reshape(N, C, H, W)
+        masks_flat = masks.reshape(N, K, 1, H, W)
+        valid_flat = valid.reshape(N, K)
+
+        if K == 0 or N == 0:
+            z = torch.empty((B, M, 0, self.embedding_dim), device=device, dtype=torch.float32)
+            v = torch.zeros((B, M, 0), device=device, dtype=torch.bool)
+            meta = {"is_patch": v, "is_vanish_patch": v, "is_topk_patch": v, "patch_py": v.long(), "patch_px": v.long(), "Hf": 0, "Wf": 0}
+            return z, v, masks.squeeze(3), concept_gid_bmk, meta
+
+        fmap4 = self._get_layer4_fmap(x_flat)
+        Nf, C4, H4, W4 = fmap4.shape
+        if Nf != N:
+            raise ValueError(f"Unexpected fmap N={Nf} for N={N}")
+
+        # Pool mask embeddings on fmap and project to embedding space.
+        z_nkd = self._pool_object_embeddings_from_layer4(fmap4=fmap4, masks_img=masks_flat, valid=valid_flat)  # (N,K,D)
+
+        # Track which candidates are patch-derived.
+        is_vanish_patch = torch.zeros((N, K), device=device, dtype=torch.bool)
+        is_topk_patch = torch.zeros((N, K), device=device, dtype=torch.bool)
+        patch_py = torch.full((N, K), -1, device=device, dtype=torch.long)
+        patch_px = torch.full((N, K), -1, device=device, dtype=torch.long)
+
+        # --------------------------------------------------------------
+        # (1) Mask-vanish fallback: if downsampled mask becomes empty.
+        # --------------------------------------------------------------
+        # Downsample masks to fmap resolution and check mass.
+        masks_ds = F.interpolate(
+            masks_flat.view(N * K, 1, H, W).float(),
+            size=(H4, W4),
+            mode="area",
+        ).view(N, K, 1, H4, W4)
+        ds_mass = masks_ds.sum(dim=(2, 3, 4))  # (N,K)
+
+        vanish = (ds_mass <= 1e-6) & valid_flat
+        if bool(vanish.any().item()):
+            idx = vanish.nonzero(as_tuple=False)  # (n_v,2) [n,k]
+            n_ids = idx[:, 0]
+            k_ids = idx[:, 1]
+
+            # Gather the corresponding masks at image resolution to compute centroids.
+            m_sel = masks_flat[n_ids, k_ids, 0]  # (n_v,H,W)
+            m_sum = m_sel.sum(dim=(1, 2)).clamp(min=1e-6)
+
+            ys = torch.arange(H, device=device, dtype=torch.float32)
+            xs = torch.arange(W, device=device, dtype=torch.float32)
+            yc = (m_sel.sum(dim=2) * ys.view(1, H)).sum(dim=1) / m_sum
+            xc = (m_sel.sum(dim=1) * xs.view(1, W)).sum(dim=1) / m_sum
+
+            py = torch.clamp((yc * float(H4) / float(H)).long(), 0, int(H4) - 1)
+            px = torch.clamp((xc * float(W4) / float(W)).long(), 0, int(W4) - 1)
+
+            fmap_p = _avgpool_fmap(fmap4)
+            patch_vec = fmap_p[n_ids, :, py, px]  # (n_v,C4)
+            z_patch = proj(patch_vec).float()  # (n_v,D)
+            z_patch = l2norm_obj(z_patch)
+
+            # Build a dense (N,K,D) patch tensor via differentiable index_put.
+            z_patch_full = torch.zeros((N, K, z_patch.size(1)), device=device, dtype=z_patch.dtype)
+            z_patch_full = z_patch_full.index_put((n_ids, k_ids), z_patch)
+
+            z_nkd = torch.where(vanish.unsqueeze(-1), z_patch_full, z_nkd)
+
+            is_vanish_patch = vanish
+            patch_py[n_ids, k_ids] = py
+            patch_px[n_ids, k_ids] = px
+
+        # --------------------------------------------------------------
+        # (2) No-mask fallback: if a frame has no valid candidates.
+        # --------------------------------------------------------------
+        frame_has_any = valid_flat.any(dim=1)  # (N,)
+        need_topk = ~frame_has_any
+
+        P = int(H4 * W4)
+        kfill = int(min(int(getattr(self, "mil_patch_topk", 4)), int(K), P))
+        kfill = max(kfill, 0)
+
+        if bool(need_topk.any().item()) and kfill > 0:
+            fmap_p = _avgpool_fmap(fmap4)
+            cells = fmap_p.permute(0, 2, 3, 1).reshape(N, P, C4)
+            z_cells = proj(cells.reshape(N * P, C4)).view(N, P, -1).float()  # (N,P,D)
+            score = z_cells.norm(dim=2)  # (N,P)
+            top_idx = torch.topk(score, k=kfill, dim=1, largest=True, sorted=True).indices  # (N,k)
+
+            idx_exp = top_idx.unsqueeze(-1).expand(-1, -1, z_cells.size(2))
+            z_top = torch.gather(z_cells, 1, idx_exp)  # (N,k,D)
+            z_top = l2norm_obj(z_top)
+
+            # Only apply to frames that need it.
+            n_fill = need_topk.nonzero(as_tuple=False).view(-1)
+            # Build dense (N,K,D) tensor for the filled slots.
+            n_ids = n_fill.repeat_interleave(kfill)
+            k_ids = torch.arange(kfill, device=device, dtype=torch.long).repeat(int(n_fill.numel()))
+            src = z_top[n_fill].reshape(-1, z_top.size(2))
+
+            z_fill_full = torch.zeros((N, K, z_top.size(2)), device=device, dtype=z_top.dtype)
+            z_fill_full = z_fill_full.index_put((n_ids, k_ids), src)
+
+            kk = torch.arange(K, device=device).view(1, K)
+            fill_mask = need_topk.view(N, 1) & (kk < int(kfill))  # (N,K)
+
+            z_nkd = torch.where(fill_mask.unsqueeze(-1), z_fill_full, z_nkd)
+            valid_flat = valid_flat | fill_mask
+
+            is_topk_patch = is_topk_patch | fill_mask
+            py_top = (top_idx // int(W4)).long()
+            px_top = (top_idx % int(W4)).long()
+            patch_py[n_fill, :kfill] = py_top[n_fill]
+            patch_px[n_fill, :kfill] = px_top[n_fill]
+
+            # For top-k fallback patches, concept IDs are undefined: force -1.
+            if concept_gid_bmk is not None:
+                concept_gid_flat = concept_gid_bmk.view(N, K)
+                concept_gid_flat[n_fill, :kfill] = -1
+                concept_gid_bmk = concept_gid_flat.view(B, M, K)
+
+        is_patch = is_vanish_patch | is_topk_patch
+
+        # Apply adapter (image-only) and re-normalize.
+        if self.img_adapter_enable:
+            z_nkd = l2norm_obj(self.img_adapter(z_nkd))
+
+        z_bmkd = z_nkd.view(B, M, K, -1)
+        valid_bmk = valid_flat.view(B, M, K)
+
+        cand_meta = {
+            "is_patch": is_patch.view(B, M, K),
+            "is_vanish_patch": is_vanish_patch.view(B, M, K),
+            "is_topk_patch": is_topk_patch.view(B, M, K),
+            "patch_py": patch_py.view(B, M, K),
+            "patch_px": patch_px.view(B, M, K),
+            "Hf": int(H4),
+            "Wf": int(W4),
         }
 
-    def calculate_joint_loss(self, batch, stage, log, batch_idx, eval_textgen=False, ce_weight=None):
-        # batch may come as ((x, y, y_len, raw_y), meta) to support temporal VM
-        x, y, y_len, raw_y, batch_meta = self._split_batch(batch)
+        return z_bmkd, valid_bmk, masks.squeeze(3), concept_gid_bmk, cand_meta
 
-        ret = {'batch_size': x.size(0)}
+    def _build_tracks(self, z_bmkd: torch.Tensor, valid_bmk: torch.Tensor) -> List[torch.Tensor]:
+        """Build per-sample tracks (variable length list of (R_i,D))."""
 
-        # reuse image_features, image_feature_map and text_outputs if possible
+        B, M, K, D = z_bmkd.shape
+        tracks: List[torch.Tensor] = []
+
+        if K == 0 or B == 0:
+            return [torch.empty((0, D), device=z_bmkd.device, dtype=z_bmkd.dtype) for _ in range(B)]
+
+        if self.mil_track:
+            cfg = TrackConfig(sim_thresh=self.mil_track_sim_thresh, max_tracks=self.mil_track_max_tracks)
+            for i in range(B):
+                tr = build_object_tracks_greedy(z_bmkd[i], valid_bmk[i], cfg)
+                tracks.append(tr)
+        else:
+            # No tracking: just flatten all candidates.
+            for i in range(B):
+                z_i = z_bmkd[i].reshape(M * K, D)
+                v_i = valid_bmk[i].reshape(M * K)
+                tracks.append(z_i[v_i])
+
+        return tracks
+
+    def _proto_logits_text_to_bag(
+        self,
+        q_text_local: torch.Tensor,  # (B,Kp)
+        q_track_global: torch.Tensor,  # (Bg,R,Kp)
+        mask_global: torch.Tensor,  # (Bg,R)
+        tau: float,
+    ) -> torch.Tensor:
+        """Compute logits for local texts (rows) vs global bags (cols)."""
+
+        tau = max(float(tau), 1e-6)
+        # sim: (B, Bg, R)
+        sim = torch.einsum("ik,jrk->ijr", q_text_local, q_track_global)
+        sim = sim.masked_fill(~mask_global.unsqueeze(0), float("-inf"))
+        logits = torch.logsumexp(sim / tau, dim=-1) * tau  # (B,Bg)
+        return logits
+
+    def _proto_logits_bag_to_text(
+        self,
+        q_track_local: torch.Tensor,  # (B,R,Kp)
+        mask_local: torch.Tensor,  # (B,R)
+        q_text_global: torch.Tensor,  # (Bg,Kp)
+        tau: float,
+    ) -> torch.Tensor:
+        """Compute logits for local bags (rows) vs global texts (cols)."""
+
+        tau = max(float(tau), 1e-6)
+        # sim: (B, Bg, R)
+        sim = torch.einsum("jrk,ik->jir", q_track_local, q_text_global)
+        sim = sim.masked_fill(~mask_local.unsqueeze(1), float("-inf"))
+        logits = torch.logsumexp(sim / tau, dim=-1) * tau  # (B,Bg)
+        return logits
+
+    def _compute_w_align(
+        self, q_text: torch.Tensor, q_track: torch.Tensor, cand_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute w_align and best track index per sample.
+
+        Returns:
+          w_align: (B,) in [0,1]
+          best_sim: (B,) best proto-space dot(q_text, q_track)
+          best_r: (B,) long (index into R dimension; -1 means no non-null track)
+        """
+
+        device = q_text.device
+        B, R, Kp = q_track.shape
+        if B == 0:
+            return (
+                torch.zeros((0,), device=device),
+                torch.zeros((0,), device=device),
+                torch.full((0,), -1, device=device, dtype=torch.long),
+            )
+
+        # sim_r: (B,R)
+        sim_r = (q_track * q_text.unsqueeze(1)).sum(dim=2)
+
+        counts = cand_mask.long().sum(dim=1)  # includes null
+        null_idx = (counts - 1).clamp(min=0)
+
+        non_null_mask = cand_mask.clone()
+        non_null_mask[torch.arange(B, device=device), null_idx] = False
+
+        sim_r = sim_r.masked_fill(~non_null_mask, float("-inf"))
+        best_sim, best_r = sim_r.max(dim=1)
+
+        has_non_null = non_null_mask.any(dim=1)
+        best_r = torch.where(has_non_null, best_r, torch.full_like(best_r, -1))
+        best_sim = torch.where(has_non_null, best_sim, torch.zeros_like(best_sim))
+
+        # Warmup: keep w_align=1 early to avoid starving the MIL signal.
+        if int(self.global_step) < int(self.w_align_warmup_steps):
+            w = torch.ones_like(best_sim)
+        else:
+            s0 = float(self.w_align_sim0)
+            ss = max(float(self.w_align_simscale), 1e-6)
+            w = torch.sigmoid((best_sim - s0) / ss)
+
+        w = w.clamp(min=float(self.w_align_min), max=1.0)
+        # If no track: allow the sample to act as negative, but don't weigh it as positive.
+        w = torch.where(has_non_null, w, torch.zeros_like(w))
+        return w.detach(), best_sim.detach(), best_r.detach()
+
+    def _maybe_warm_start_prototypes(
+        self,
+        *,
+        track_emb: torch.Tensor,  # (B,R,D) incl null
+        cand_mask: torch.Tensor,  # (B,R)
+        text_feat: torch.Tensor,  # (B,D)
+    ) -> None:
+        """Collect confident examples and warm-start prototype memory once."""
+
+        if (not self.proto_enable) or (self.proto_mem is None) or (not self.proto_warm_start) or self._proto_warm_started:
+            return
+
+        device = track_emb.device
+        B, R, D = track_emb.shape
+        if B == 0:
+            return
+
+        # Select best *non-null* track by embedding-space cosine with text.
+        counts = cand_mask.long().sum(dim=1)
+        null_idx = (counts - 1).clamp(min=0)
+        non_null_mask = cand_mask.clone()
+        non_null_mask[torch.arange(B, device=device), null_idx] = False
+
+        # (B,R)
+        sim = torch.einsum("brd,bd->br", track_emb, l2norm_obj(text_feat))
+        sim = sim.masked_fill(~non_null_mask, float("-inf"))
+        best_sim, best_r = sim.max(dim=1)
+
+        good = best_sim >= float(self.proto_warm_sim_thresh)
+        good = good & non_null_mask.any(dim=1)
+
+        if bool(good.any().item()):
+            idx = good.nonzero(as_tuple=False).view(-1)
+            # Add at most a small number per step to avoid huge CPU lists.
+            max_add = int(self.args.get("proto_warm_max_add_per_step", 64))
+            idx = idx[:max_add]
+            z_add = track_emb[idx, best_r[idx]].detach().cpu()  # (n,D)
+            self._proto_warm_buffer.extend([z_add[i] for i in range(z_add.size(0))])
+
+        # Every step, compute global readiness via all_reduce(min).
+        local_ready = 1 if len(self._proto_warm_buffer) >= int(self.proto_warm_min_local) else 0
+        if _is_dist_active():
+            flag = torch.tensor(local_ready, device=device, dtype=torch.int64)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            global_ready = int(flag.item()) == 1
+        else:
+            global_ready = bool(local_ready)
+
+        if not global_ready:
+            return
+
+        # Warm-start now.
+        z_local = torch.stack(self._proto_warm_buffer, dim=0).to(device=device, dtype=torch.float32)
+        # Optional subsample (warm_start_ddp() also subsamples globally, but local cap helps memory).
+        max_local = int(self.args.get("proto_warm_max_local", 1024))
+        if z_local.size(0) > max_local:
+            perm = torch.randperm(z_local.size(0), device=device)
+            z_local = z_local[perm[:max_local]]
+
+        # Deterministic seed based on run id if provided.
+        seed = int(self.args.get("seed", 0))
+        # NOTE: warm_start_ddp() gathers examples across ranks and initializes prototypes once.
+        self.proto_mem.warm_start_ddp(
+            z_local,
+            seed=seed,
+            kmeans_iters=int(self.proto_warm_kmeans_iters),
+            max_total=int(self.proto_warm_max_total),
+            verbose=((self.trainer is None) or bool(getattr(self.trainer, "is_global_zero", False))),
+        )
+        self._proto_warm_started = True
+        self._proto_warm_buffer = []
+
+        if (self.trainer is None) or self.trainer.is_global_zero:
+            print(
+                f"[multimodal_lit] Prototype warm-start complete: "
+                f"K={self.proto_num}, seed={seed}, world={_dist_world()}"
+            )
+
+    # ------------------------------------------------------------------
+    # MIL core (Plan A)
+    # ------------------------------------------------------------------
+    def _mil_losses(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        y_len: torch.Tensor,
+        raw_y: Optional[Any],
+        meta: Optional[dict],
+        *,
+        update_memory: bool,
+        stage: str = "train",
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute Plan-A MIL losses + memory update.
+
+        Returns:
+          aux_loss: scalar tensor (weighted sum)
+          stats: dict of tensors for logging
+        """
+
+        device = x.device
+        zero = x.new_tensor(0.0)
+
+        if not self.mil_enable:
+            return zero, {
+                "mil_loss": zero.detach(),
+                "mil_acc": zero.detach(),
+                "mil_acc_t2i": zero.detach(),
+                "mil_acc_i2t": zero.detach(),
+                "noun_count_mean": zero.detach(),
+                "noun_sample_frac": zero.detach(),
+                "noun_query_frac": zero.detach(),
+                "concept_align_loss": zero.detach(),
+                "concept_align_acc": zero.detach(),
+                "concept_align_n": zero.detach(),
+                "w_align_mean": zero.detach(),
+                "w_align_eff_mean": zero.detach(),
+                "sam_concept_weight_mean": zero.detach(),
+                "track_coh_loss": zero.detach(),
+                "go_loss": zero.detach(),
+                "proto_update_loss": zero.detach(),
+                "proto_usage_eff_k": zero.detach(),
+                "sam_mask_frac": zero.detach(),
+                "patch_frac": zero.detach(),
+            }
+
+        x_bag, sam_mask, sam_concept = self._get_bag_tensors(x, meta)
+
+        # Helpful one-time warning: if you're expecting SAM masks but none show up,
+        # MIL will effectively run on empty candidates.
+        if (sam_mask is None) and (not getattr(self, "_warned_missing_sam_mask", False)) and (str(stage) == "train"):
+            if self.sam_prepacked_dir is not None:
+                if int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0"))) == 0:
+                    print(
+                        "[multimodal_lit] WARNING: MIL is enabled but batch meta has no 'sam_mask'. "
+                        "If you expect SAM masks, make sure the dataset/dataloader populates meta['sam_mask'] "
+                        "(and optional meta['sam_concept_ids'])."
+                    )
+            self._warned_missing_sam_mask = True
+        B, M, _, H, W = x_bag.shape
+
+        # Text embeddings (sentence + optional noun pivots)
+        text_feat_sent, _ = self.model.encode_text(y, y_len)
+        text_feat_sent = l2norm_obj(text_feat_sent.float())
+
+        # Default: sentence embedding as the MIL text query.
+        text_feat = text_feat_sent
+        noun_count_mean = zero.detach()
+        noun_sample_frac = zero.detach()
+        noun_query_frac = zero.detach()
+        noun_count_b = None
+        text_query_bnd = None  # (B, Nn, D) for noun_multi
+        query_valid_bn = None  # (B, Nn)
+
+        mode = str(getattr(self, "mil_text_mode", "sentence")).lower()
+        if mode in ("noun_avg", "noun_multi"):
+            noun_feat_bnd, noun_valid_bn, noun_count_b = self._noun_features_from_raw_y(raw_y, B=B, device=device)
+            if noun_count_b.numel() > 0:
+                noun_count_mean = noun_count_b.float().mean().detach()
+                noun_sample_frac = (noun_count_b > 0).float().mean().detach()
+            # Average nouns -> one vector per sample (fallback to sentence if no nouns).
+            denom = noun_valid_bn.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+            noun_sum = (noun_feat_bnd * noun_valid_bn.float().unsqueeze(-1)).sum(dim=1)
+            noun_avg = l2norm_obj(noun_sum / denom)
+            has_noun = noun_valid_bn.any(dim=1)
+            text_feat = torch.where(has_noun.unsqueeze(1), noun_avg, text_feat_sent)
+            text_feat = l2norm_obj(text_feat)
+
+            if mode == "noun_multi":
+                # Multi-noun queries for t2i (keep i2t on the bag-level text_feat).
+                text_query_bnd = noun_feat_bnd
+                query_valid_bn = noun_valid_bn
+                # Ensure every sample contributes at least one query.
+                no_noun = ~has_noun
+                if bool(no_noun.any().item()):
+                    sent_first = text_feat_sent.unsqueeze(1)  # (B,1,D)
+                    text_query_bnd = torch.where(
+                        no_noun.view(B, 1, 1),
+                        torch.cat([sent_first, text_query_bnd[:, 1:, :]], dim=1),
+                        text_query_bnd,
+                    )
+                    query_valid_bn = torch.where(
+                        no_noun.view(B, 1),
+                        torch.cat([torch.ones(B, 1, device=device, dtype=torch.bool), query_valid_bn[:, 1:]], dim=1),
+                        query_valid_bn,
+                    )
+                noun_query_frac = query_valid_bn.float().mean().detach()
+            else:
+                noun_query_frac = noun_valid_bn.float().mean().detach()
+
+        sam_count = meta.get("sam_mask_count", None) if isinstance(meta, dict) else None
+
+        # Per-frame candidates
+        z_bmkd, valid_bmk, masks_bmkhw, sam_gid_bmk, cand_meta = self._compute_frame_candidates(
+            x_bag=x_bag, sam_mask=sam_mask, sam_count=sam_count, sam_concept=sam_concept
+        )
+
+        # Fractions: how often we are using SAM masks vs patch fallbacks
+        is_patch_bmk = None
+        patch_py_bmk = None
+        patch_px_bmk = None
+        Hf = int(cand_meta.get("Hf", 0)) if isinstance(cand_meta, dict) else 0
+        Wf = int(cand_meta.get("Wf", 0)) if isinstance(cand_meta, dict) else 0
+        if isinstance(cand_meta, dict):
+            is_patch_bmk = cand_meta.get("is_patch", None)
+            patch_py_bmk = cand_meta.get("patch_py", None)
+            patch_px_bmk = cand_meta.get("patch_px", None)
+        if is_patch_bmk is None:
+            is_patch_bmk = torch.zeros_like(valid_bmk, dtype=torch.bool)
+        n_frames = int(B) * int(M)
+        if n_frames > 0:
+            sam_frame = (valid_bmk & (~is_patch_bmk)).any(dim=2)
+            patch_frame = (valid_bmk & is_patch_bmk).any(dim=2)
+            sam_mask_frac = sam_frame.float().mean().detach()
+            patch_frac = patch_frame.float().mean().detach()
+        else:
+            sam_mask_frac = zero.detach()
+            patch_frac = zero.detach()
+
+        # Tracks
+        tracks_per_sample = self._build_tracks(z_bmkd, valid_bmk)
+
+        # Pack tracks with a learnable null
+        null_emb = l2norm_obj(self.null_obj.to(device=device, dtype=torch.float32))
+        track_emb, cand_mask = pack_candidates_with_null(tracks_per_sample, null_emb)
+        track_emb = l2norm_obj(track_emb.float())
+
+        # Warm-start prototypes (one-shot). IMPORTANT: training-only (avoid val/test leakage).
+        if bool(update_memory):
+            self._maybe_warm_start_prototypes(track_emb=track_emb, cand_mask=cand_mask, text_feat=text_feat)
+
+        # If prototypes are disabled, fall back to embedding-space MIL (legacy behavior).
+        if (not self.proto_enable) or (self.proto_mem is None):
+            # Build a (B,B) MIL matrix using embedding-space similarities.
+            logits = mil_logsumexp_logits(text_feat, track_emb, cand_mask, tau=float(self.mil_tau))
+            tgt = torch.arange(B, device=device, dtype=torch.long)
+            loss_row = F.cross_entropy(logits, tgt)
+            loss_col = F.cross_entropy(logits.t(), tgt)
+            mil_loss = 0.5 * (loss_row + loss_col)
+            aux = float(self.mil_lambda) * mil_loss
+            acc_t2i = (logits.argmax(dim=1) == tgt).float().mean()
+            acc_i2t = (logits.argmax(dim=0) == tgt).float().mean()
+            acc = 0.5 * (acc_t2i + acc_i2t)
+
+            return aux, {
+                "mil_loss": mil_loss.detach(),
+                "mil_acc": acc.detach(),
+                "mil_acc_t2i": acc_t2i.detach(),
+                "mil_acc_i2t": acc_i2t.detach(),
+                "noun_count_mean": noun_count_mean,
+                "noun_sample_frac": noun_sample_frac,
+                "noun_query_frac": noun_query_frac,
+                "concept_align_loss": zero.detach(),
+                "concept_align_acc": zero.detach(),
+                "concept_align_n": zero.detach(),
+                "w_sample_mean": zero.detach(),
+                "best_sim_mean": zero.detach(),
+                "best_r_mode": zero.detach(),
+                "avg_tracks": zero.detach(),
+                "avg_eff_tracks": zero.detach(),
+                "sam_concept_weight_nonzero": zero.detach(),
+                "w_align_mean": zero.detach(),
+                "w_align_eff_mean": zero.detach(),
+                "sam_concept_weight_mean": zero.detach(),
+                "track_coh_loss": zero.detach(),
+                "go_loss": zero.detach(),
+                "proto_update_loss": zero.detach(),
+                "proto_usage_eff_k": zero.detach(),
+                "sam_mask_frac": sam_mask_frac,
+                "patch_frac": patch_frac,
+            }
+
+        # Prototype assignments (with grad w.r.t. embeddings)
+        q_text = self.proto_mem.assign_with_grad(text_feat)  # (B,Kp)
+
+        # Pad R across ranks before gathering.
+        R_local = int(track_emb.size(1))
+        R = R_local
+        if _is_dist_active():
+            rmax = torch.tensor([R_local], device=device, dtype=torch.int64)
+            dist.all_reduce(rmax, op=dist.ReduceOp.MAX)
+            R = int(rmax.item())
+
+        if R > R_local:
+            pad = torch.zeros((B, R - R_local, self.embedding_dim), device=device, dtype=track_emb.dtype)
+            track_emb = torch.cat([track_emb, pad], dim=1)
+            padm = torch.zeros((B, R - R_local), device=device, dtype=torch.bool)
+            cand_mask = torch.cat([cand_mask, padm], dim=1)
+
+        q_track = self.proto_mem.assign_with_grad(track_emb.view(B * R, self.embedding_dim)).view(B, R, -1)
+
+        # Alignment gating from best within-sample match in proto space.
+        w_align, best_sim, best_r = self._compute_w_align(q_text, q_track, cand_mask)
+        w_align_mean = w_align.mean().detach() if w_align.numel() > 0 else zero.detach()
+
+        # Optional: concept-frequency reweighting (uses SamConceptRegistry).
+        #
+        # We approximate a "track concept" by taking the anchor-frame (m=0)
+        # candidate whose embedding is closest to the selected best track, and
+        # apply the corresponding global concept weight to the per-sample loss.
+        w_sample = w_align
+        sam_w_mean = zero.detach()
+        w_sample_mean = w_align_mean
+        if (
+            self.sam_use_concept_weights
+            and (self.sam_registry is not None)
+            and (sam_gid_bmk is not None)
+            and (B > 0)
+        ):
+            weights_g = self.sam_registry.weights.to(device=device, dtype=torch.float32)
+            Cg = int(weights_g.numel())
+            sam_w = torch.ones((B,), device=device, dtype=torch.float32)
+
+            # Anchor-frame concept for best track.
+            for i in range(B):
+                r = int(best_r[i].item())
+                if r < 0:
+                    continue
+                v0 = valid_bmk[i, 0]
+                if not bool(v0.any().item()):
+                    continue
+                tr = track_emb[i, r].detach()
+                sims = (z_bmkd[i, 0].detach() @ tr).masked_fill(~v0, float("-inf"))
+                k = int(torch.argmax(sims).item())
+                gid = int(sam_gid_bmk[i, 0, k].item())
+                if 0 <= gid < Cg:
+                    sam_w[i] = weights_g[gid]
+
+            sam_w = sam_w.clamp(min=0.0)
+            sam_w_mean = sam_w.mean().detach() if sam_w.numel() > 0 else zero.detach()
+            w_sample = w_align * sam_w
+            w_sample_mean = w_sample.mean().detach() if w_sample.numel() > 0 else zero.detach()
+
+        # -------------------------
+        # Prototype-space MIL loss (distributed)
+        # -------------------------
+        mil_loss = zero
+        mil_acc = zero
+        mil_acc_t2i = zero
+        mil_acc_i2t = zero
+
+        if self.mil_lambda > 0.0 and B > 1:
+            rank = _dist_rank()
+            # Contrast bags and texts across GPUs (global batch)
+            q_text_all = self._dist_all_gather_with_grad(q_text)
+            q_track_all = self._dist_all_gather_with_grad(q_track)
+            mask_all = self._dist_all_gather_no_grad(cand_mask)
+
+            # Text->bag (t2i)
+            use_multi = (
+                str(getattr(self, "mil_text_mode", "sentence")).lower() == "noun_multi"
+                and text_query_bnd is not None
+                and query_valid_bn is not None
+            )
+
+            if use_multi:
+                Nn = int(text_query_bnd.shape[1])
+                q_text_q = self.proto_mem.assign_with_grad(text_query_bnd.reshape(B * Nn, -1))  # (B*Nn,Kp)
+                logits_t2i = self._proto_logits_text_to_bag(q_text_q, q_track_all, mask_all, tau=float(self.mil_tau))  # (B*Nn,Bg)
+                tgt_t2i = (torch.arange(B, device=device) + rank * B).repeat_interleave(Nn)
+
+                loss_t2i_row = F.cross_entropy(logits_t2i, tgt_t2i, reduction="none")
+                valid_flat = query_valid_bn.reshape(B * Nn).float()
+
+                # Weighting: keep *per-sample* weight roughly constant regardless of
+                # how many nouns it has (so captions with 5 nouns don't dominate).
+                q_count = query_valid_bn.float().sum(dim=1).clamp(min=1.0)  # (B,)
+                w_per_query = (w_sample / q_count).repeat_interleave(Nn)
+                w_query = w_per_query * valid_flat
+                denom_q = w_query.sum().clamp(min=1e-12)
+                loss_t2i = (w_query * loss_t2i_row).sum() / denom_q
+
+                mil_acc_t2i = (
+                    ((logits_t2i.argmax(dim=1) == tgt_t2i).float() * valid_flat).sum()
+                    / valid_flat.sum().clamp(min=1e-12)
+                )
+            else:
+                logits_t2i = self._proto_logits_text_to_bag(q_text, q_track_all, mask_all, tau=float(self.mil_tau))
+                tgt = torch.arange(B, device=device) + rank * B
+
+                loss_t2i_row = F.cross_entropy(logits_t2i, tgt, reduction="none")
+                denom = w_sample.sum().clamp(min=1e-12)
+                loss_t2i = (w_sample * loss_t2i_row).sum() / denom
+
+                mil_acc_t2i = (logits_t2i.argmax(dim=1) == tgt).float().mean()
+
+            # Bag->text (i2t): always uses one text vector per sample (sentence / noun_avg)
+            logits_i2t = self._proto_logits_bag_to_text(q_track, cand_mask, q_text_all, tau=float(self.mil_tau))
+            tgt_i2t = torch.arange(B, device=device) + rank * B
+
+            loss_i2t_row = F.cross_entropy(logits_i2t, tgt_i2t, reduction="none")
+            denom = w_sample.sum().clamp(min=1e-12)
+            loss_i2t = (w_sample * loss_i2t_row).sum() / denom
+
+            mil_acc_i2t = (logits_i2t.argmax(dim=1) == tgt_i2t).float().mean()
+
+            mil_loss = 0.5 * (loss_t2i + loss_i2t)
+            mil_acc = 0.5 * (mil_acc_t2i + mil_acc_i2t)
+
+        # -------------------------
+        # Track coherence (prototype space)
+        # -------------------------
+        coh_loss = zero
+        coh_pairs = zero
+
+        if self.track_coh_enable and (self.track_coh_lambda > 0.0):
+            eps = 1e-8
+            sum_loss = zero
+            sum_w = zero
+            pairs = zero
+
+            # Candidate embeddings for selection in embedding space.
+            # z_bmkd: (B,M,K,D), valid_bmk: (B,M,K)
+            for i in range(B):
+                w_i = w_sample[i].detach()
+                if float(w_i.item()) <= 0.0:
+                    continue
+
+                # number of non-null tracks for sample i
+                cnt = int(cand_mask[i].long().sum().item())
+                if cnt <= 1:
+                    continue
+                null_i = cnt - 1
+
+                loss_i = zero
+                n_tracks_used = 0
+                pairs_i = 0
+
+                for r in range(null_i):
+                    tr = track_emb[i, r]  # (D,)
+                    # pick best instance per frame
+                    chosen: List[torch.Tensor] = []
+                    for m in range(M):
+                        v = valid_bmk[i, m]
+                        if not bool(v.any().item()):
+                            continue
+                        sims = (z_bmkd[i, m] @ tr).masked_fill(~v, float("-inf"))
+                        k = int(torch.argmax(sims).item())
+                        s = float(sims[k].item())
+                        if np.isfinite(s) and (s >= float(self.track_coh_match_thresh)):
+                            chosen.append(z_bmkd[i, m, k])
+
+                    if len(chosen) < int(self.track_coh_min_frames):
+                        continue
+
+                    z_sel = torch.stack(chosen, dim=0)  # (L,D)
+                    q_sel = self.proto_mem.assign_with_grad(z_sel)  # (L,Kp)
+
+                    # Teacher = track proto distribution (stop-grad)
+                    q_tr = q_track[i, r].detach().clamp(min=eps)
+                    q_tr = q_tr / q_tr.sum().clamp(min=eps)
+
+                    kl = F.kl_div(torch.log(q_sel.clamp(min=eps)), q_tr.expand_as(q_sel), reduction="none").sum(dim=1)
+                    kl_mean = kl.mean()
+
+                    loss_i = loss_i + kl_mean
+                    n_tracks_used += 1
+                    pairs_i += int(q_sel.size(0))
+
+                if n_tracks_used > 0:
+                    loss_i = loss_i / float(n_tracks_used)
+                    sum_loss = sum_loss + w_i * loss_i
+                    sum_w = sum_w + w_i
+                    pairs = pairs + x.new_tensor(float(pairs_i))
+
+            if float(sum_w.detach().item()) > 0.0:
+                coh_loss = sum_loss / sum_w.clamp(min=1e-12)
+                coh_pairs = pairs.detach()
+
+        # -------------------------
+        # Global-object agreement (global emb vs recalled best track)
+        # -------------------------
+        go_loss = zero
+        go_sim = zero
+
+        if self.go_enable and (self.go_lambda > 0.0):
+            # Global embedding for anchor frame (frame 0)
+            x_anchor = x_bag[:, 0]
+            g, _ = self.model.encode_image(x_anchor)
+            g = l2norm_obj(g.float())
+            if self.img_adapter_enable:
+                g = l2norm_obj(self.img_adapter(g))
+
+            sims: List[torch.Tensor] = []
+            ws: List[torch.Tensor] = []
+
+            for i in range(B):
+                if float(w_sample[i].item()) <= 0.0:
+                    continue
+                r = int(best_r[i].item())
+                if r < 0:
+                    continue
+
+                tr = track_emb[i, r]
+                _q, z_rec = self.proto_mem.recall_with_grad(tr.unsqueeze(0))
+                z_rec = z_rec.squeeze(0)
+
+                s = (g[i] * z_rec).sum()
+                sims.append(s)
+                ws.append(w_sample[i])
+
+            if sims:
+                sim_t = torch.stack(sims, dim=0)
+                w_t = torch.stack(ws, dim=0).clamp(min=1e-12)
+                go_sim = (w_t * sim_t).sum() / w_t.sum()
+                go_loss = 1.0 - go_sim
+
+        # -------------------------
+        # Pivot C: SAM concept->object alignment (optional)
+        # -------------------------
+        concept_align_loss = zero
+        concept_align_acc = zero
+        concept_align_n = zero
+
+        if (
+            self.sam_concept_align_enable
+            and (self.sam_concept_align_lambda > 0.0)
+            and (self.sam_registry is not None)
+            and (sam_gid_bmk is not None)
+        ):
+            # Only true SAM-mask candidates (exclude patch fallbacks) with a valid concept id
+            mask_c = valid_bmk & (~is_patch_bmk) & (sam_gid_bmk >= 0)
+            if bool(mask_c.any().item()):
+                z_obj = z_bmkd[mask_c]
+                z_obj = l2norm_obj(z_obj.float())
+                gid = sam_gid_bmk[mask_c].long()
+
+                uniq, inv = torch.unique(gid, sorted=True, return_inverse=True)
+                uniq_list = uniq.detach().cpu().tolist()
+                concept_strs = [self.sam_registry.idx2concept[int(g)] for g in uniq_list]
+
+                # Encode concept strings
+                tok, tok_len = self._tokenize_phrases(concept_strs)
+                tok = tok.to(device)
+                tok_len = tok_len.to(device)
+                c_feat, _ = self.model.encode_text(tok, tok_len)
+                c_feat = l2norm_obj(c_feat.float())
+
+                logits = (z_obj @ c_feat.t()) / float(self.sam_concept_align_tau)
+                concept_align_loss = F.cross_entropy(logits, inv)
+                concept_align_acc = (logits.argmax(dim=1) == inv).float().mean().detach()
+                concept_align_n = z_obj.new_tensor(float(z_obj.size(0))).detach()
+
+        # -------------------------
+        # Prototype memory update (EMA) from track embeddings
+        # -------------------------
+        proto_up_loss = zero
+        proto_eff_k = zero
+
+        # Compute the prototype quantization loss for monitoring on any stage,
+        # but only update the EMA prototypes during training.
+        if self.proto_mem is not None:
+            # Exclude null tracks
+            counts = cand_mask.long().sum(dim=1)
+            null_idx = (counts - 1).clamp(min=0)
+            non_null_mask = cand_mask.clone()
+            non_null_mask[torch.arange(B, device=device), null_idx] = False
+
+            z_update = track_emb[non_null_mask]
+            if z_update.ndim == 1:
+                z_update = z_update.unsqueeze(0)
+            with torch.no_grad():
+                proto_up_loss, pstats = self.proto_mem.proto_loss_ddp_gather(
+                    z_update.detach(),
+                    update_ema=bool(update_memory),
+                )
+            proto_eff_k = pstats.get("usage_eff_k", zero).detach()
+
+        # -------------------------
+        # Debug track grids (optional)
+        # -------------------------
+        if (
+            self.debug_save_tracks
+            and str(stage) == "train"
+            and (self.trainer is None or self.trainer.is_global_zero)
+        ):
+            # Save a few best examples by (w_align * best_sim).
+            score = (w_sample * best_sim).detach().float()
+            topk = min(int(self.debug_tracks_topk), B)
+            if topk > 0:
+                idx = torch.topk(score, k=topk, largest=True, sorted=True).indices
+                for ii in idx.tolist():
+                    # Build per-frame visualization payload for the selected best track.
+                    per_frame: List[Dict[str, Any]] = []
+                    r_sel = int(best_r[ii].item()) if torch.is_tensor(best_r) else -1
+                    tr_sel = None
+                    if r_sel >= 0:
+                        tr_sel = track_emb[ii, r_sel].detach()
+                    for m in range(M):
+                        v_m = valid_bmk[ii, m]
+                        if not bool(v_m.any().item()):
+                            per_frame.append({"kind": "none", "conf": 0.0, "sim": 0.0})
+                            continue
+                        # Pick a candidate for this frame (either by similarity to the chosen track, or first valid).
+                        if tr_sel is not None:
+                            sims = (z_bmkd[ii, m].detach() @ tr_sel).masked_fill(~v_m, float("-inf"))
+                            k_sel = int(torch.argmax(sims).item())
+                            sim_val = float(sims[k_sel].item()) if np.isfinite(float(sims[k_sel].item())) else 0.0
+                        else:
+                            k_sel = int(v_m.nonzero(as_tuple=False)[0].item())
+                            sim_val = 0.0
+                        is_p = bool(is_patch_bmk[ii, m, k_sel].item()) if torch.is_tensor(is_patch_bmk) else False
+                        kind = "patch" if is_p else "sam"
+                        mask_np = None
+                        conf = 0.0
+                        if masks_bmkhw is not None and torch.is_tensor(masks_bmkhw):
+                            mk = masks_bmkhw[ii, m, k_sel].detach().cpu()
+                            if float(mk.sum().item()) > 0.0:
+                                mask_np = mk.numpy()
+                                conf = float(mk.mean().item())
+                        info: Dict[str, Any] = {"kind": kind, "conf": float(conf), "sim": float(sim_val)}
+                        if mask_np is not None:
+                            info["mask"] = mask_np
+                        if patch_py_bmk is not None and patch_px_bmk is not None and Hf > 0 and Wf > 0:
+                            py = int(patch_py_bmk[ii, m, k_sel].item()) if torch.is_tensor(patch_py_bmk) else -1
+                            px = int(patch_px_bmk[ii, m, k_sel].item()) if torch.is_tensor(patch_px_bmk) else -1
+                            if py >= 0 and px >= 0:
+                                info.update({"py": py, "px": px, "Hf": int(Hf), "Wf": int(Wf)})
+                        per_frame.append(info)
+                    ex = {
+                        "score": float(score[ii].item()),
+                        "caption": "",
+                        "frames": x_bag[ii].detach().cpu(),
+                        "per_frame": per_frame,
+                    }
+                    self._push_dbg_track(ex)
+
+        # -------------------------
+        # Total aux loss
+        # -------------------------
+        aux = zero
+        if self.mil_lambda > 0.0:
+            aux = aux + float(self.mil_lambda) * mil_loss
+        if self.track_coh_enable and (self.track_coh_lambda > 0.0):
+            aux = aux + float(self.track_coh_lambda) * coh_loss
+        if self.go_enable and (self.go_lambda > 0.0):
+            aux = aux + float(self.go_lambda) * go_loss
+
+        if self.sam_concept_align_enable and (self.sam_concept_align_lambda > 0.0):
+            aux = aux + float(self.sam_concept_align_lambda) * concept_align_loss
+
+        stats = {
+            "mil_loss": mil_loss.detach(),
+            "mil_acc": mil_acc.detach(),
+            "mil_acc_t2i": mil_acc_t2i.detach(),
+            "mil_acc_i2t": mil_acc_i2t.detach(),
+            "noun_count_mean": noun_count_mean,
+            "noun_sample_frac": noun_sample_frac,
+            "noun_query_frac": noun_query_frac,
+            "concept_align_loss": concept_align_loss.detach(),
+            "concept_align_acc": concept_align_acc,
+            "concept_align_n": concept_align_n,
+            "w_align_mean": w_align_mean,
+            "w_align_eff_mean": w_sample_mean,
+            "sam_concept_weight_mean": sam_w_mean,
+            "track_coh_loss": coh_loss.detach(),
+            "track_coh_pairs": coh_pairs.detach(),
+            "go_loss": go_loss.detach(),
+            "go_sim": go_sim.detach(),
+            "proto_update_loss": proto_up_loss.detach(),
+            "proto_usage_eff_k": proto_eff_k.detach(),
+            "sam_mask_frac": sam_mask_frac,
+            "patch_frac": patch_frac,
+        }
+        return aux, stats
+
+    # ------------------------------------------------------------------
+    # Debug track saving
+    # ------------------------------------------------------------------
+    def _push_dbg_track(self, ex: Dict[str, Any]) -> None:
+        # Keep a small heap of top examples.
+        if not hasattr(self, "_dbg_track_heap"):
+            self._dbg_track_heap = []
+
+        heap = self._dbg_track_heap
+        score = float(ex.get("score", 0.0))
+        if len(heap) < int(self.debug_tracks_topk):
+            heap.append((score, ex))
+            heap.sort(key=lambda x: x[0])
+        else:
+            if score > heap[0][0]:
+                heap[0] = (score, ex)
+                heap.sort(key=lambda x: x[0])
+
+    def _debug_save_top_tracks_epoch_end(self) -> None:
+        if not self.debug_save_tracks:
+            return
+        if (self.trainer is not None) and (not self.trainer.is_global_zero):
+            return
+        if (int(self.current_epoch) % int(self.debug_tracks_every_n_epochs)) != 0:
+            return
+        if not getattr(self, "_dbg_track_heap", None):
+            return
+
+        # Determine output directory
+        trainer = getattr(self, "trainer", None)
+        ckpt_dir = os.getcwd()
+        if trainer is not None:
+            cb = getattr(trainer, "checkpoint_callback", None)
+            if cb is not None and getattr(cb, "dirpath", None):
+                ckpt_dir = str(cb.dirpath)
+            lg = getattr(trainer, "logger", None)
+            if lg is not None and getattr(lg, "log_dir", None):
+                ckpt_dir = str(lg.log_dir)
+
+        out_dir = os.path.join(ckpt_dir, "debug_tracks", f"epoch_{int(self.current_epoch):04d}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        items = sorted(self._dbg_track_heap, key=lambda x: float(x[0]), reverse=True)
+        alpha = float(self.debug_tracks_overlay_alpha)
+
+        for j, (score, ex) in enumerate(items):
+            frames = ex["frames"]
+            masks = ex.get("masks", None)
+            # Use precomputed per-frame vis payload if available (preferred).
+            per_frame = ex.get("per_frame", None)
+
+            if per_frame is None:
+                # Backwards-compatible fallback: show the first mask per frame if available.
+                per_frame = []
+                if masks is not None and torch.is_tensor(masks) and masks.ndim == 4:
+                    # masks: (M,K,H,W)
+                    M = int(masks.size(0))
+                    for m in range(M):
+                        mask0 = masks[m, 0].numpy()
+                        per_frame.append({"kind": "sam", "mask": mask0, "conf": 1.0, "sim": 0.0})
+                else:
+                    for _ in range(int(frames.size(0))):
+                        per_frame.append({"kind": "none", "conf": 0.0, "sim": 0.0})
+
+            grid = make_track_grid(
+                frames_mchw=frames,
+                per_frame=per_frame,
+                title=f"score={score:.3f} step={int(self.global_step)}",
+                caption="",
+                alpha=alpha,
+            )
+
+            png_path = os.path.join(out_dir, f"track_{j:02d}_score_{score:.4f}.png")
+            grid.save(png_path)
+
+            if wandb is not None and hasattr(self.logger, "experiment"):
+                try:
+                    self.logger.experiment.log({"debug_tracks/top": wandb.Image(grid)}, step=int(self.global_step))
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Main loss
+    # ------------------------------------------------------------------
+    def calculate_joint_loss(self, batch, stage, log, batch_idx, eval_textgen: bool = False, ce_weight=None):
+        x, y, y_len, raw_y, meta = self._split_batch(batch)
+
+        # Global InfoNCE uses anchor frame only.
+        x_anchor = x[:, 0] if x.ndim == 5 else x
+
+        ret: Dict[str, Any] = {"batch_size": int(x_anchor.size(0))}
         image_features, image_feature_map, text_outputs = None, None, None
 
+        # -------------------------
+        # CVCL InfoNCE
+        # -------------------------
         if self.lambda_mm or not self.optimize_unused:
-            infonce_loss, image_accuracy, text_accuracy, \
-                image_entropy, text_entropy, logits_per_image, logits_per_text, \
-                image_features, image_feature_map, text_outputs = \
-                self.calculate_contrastive_loss_ddp(x, y, y_len)
+            (
+                infonce_loss,
+                image_accuracy,
+                text_accuracy,
+                image_entropy,
+                text_entropy,
+                logits_per_image,
+                logits_per_text,
+                image_features,
+                image_feature_map,
+                text_outputs,
+            ) = self.model.calculate_contrastive_loss(x_anchor, y, y_len)
 
-            # log (DDP-safe if caller sets sync_dist=True)
-            log(f"{stage}/infonce_loss", infonce_loss, batch_size=ret['batch_size'])
-            log(f"{stage}/image_accuracy", image_accuracy, batch_size=ret['batch_size'])
-            log(f"{stage}/text_accuracy", text_accuracy, batch_size=ret['batch_size'])
-            log(f"{stage}/image_entropy", image_entropy, batch_size=ret['batch_size'])
-            log(f"{stage}/text_entropy", text_entropy, batch_size=ret['batch_size'])
-            log("temperature",
-                (-self.model.logit_neg_log_temperature).exp().item())
+            retrieval_acc = 0.5 * (image_accuracy + text_accuracy)
 
-            ret.update({
-                'infonce_loss': infonce_loss.detach(),
-                'image_accuracy': image_accuracy.detach() if torch.is_tensor(image_accuracy) else image_accuracy,
-                'text_accuracy': text_accuracy.detach() if torch.is_tensor(text_accuracy) else text_accuracy,
-                'image_entropy': image_entropy.detach() if torch.is_tensor(image_entropy) else image_entropy,
-                'text_entropy': text_entropy.detach() if torch.is_tensor(text_entropy) else text_entropy,
-            })
+            log(f"{stage}/infonce_loss", infonce_loss)
+            log(f"{stage}/retrieval_acc", retrieval_acc)
+
+            ret.update({"infonce_loss": infonce_loss.detach(), "retrieval_acc": retrieval_acc.detach()})
         else:
-            infonce_loss = torch.tensor(0.0, device=x.device)
+            infonce_loss = x_anchor.new_tensor(0.0)
+            # If we skip the main model forward (optimize_unused=True), ensure DDP doesn't error.
+            infonce_loss = self._tie_module_params_if_needed(infonce_loss, self.model)
 
-        # -------- Visual Memory: object-centric VQ loss (train-only) --------
-        vm_total = torch.tensor(0.0, device=x.device)
-        vm_q = torch.tensor(0.0, device=x.device)
-        vm_temp = torch.tensor(0.0, device=x.device)
-        vm_sep = torch.tensor(0.0, device=x.device)
-        vm_lw_reg = torch.tensor(0.0, device=x.device)
+        # -------------------------
+        # MIL + prototype memory (Plan A)
+        #   - By default we also compute these on val/test (for monitoring),
+        #     but we never update prototype EMA outside training.
+        # -------------------------
+        aux_mil = x_anchor.new_tensor(0.0)
+        do_mil = bool(self.mil_enable) and (stage == "train" or bool(getattr(self, "mil_run_val", False)))
+        if do_mil:
+            aux_mil, mil_stats = self._mil_losses(
+                x=x,
+                y=y,
+                y_len=y_len,
+                raw_y=raw_y,
+                meta=meta if isinstance(meta, dict) else None,
+                update_memory=bool(stage == "train"),
+                stage=str(stage),
+            )
 
-        vm_cid_min = torch.tensor(0.0, device=x.device)
-        vm_cid_max = torch.tensor(0.0, device=x.device)
-        vm_num_active_protos = torch.tensor(0.0, device=x.device)
-        vm_frac_active_protos = torch.tensor(0.0, device=x.device)
+            for k, v in mil_stats.items():
+                log(f"{stage}/{k}", v)
+            ret.update({k: v for k, v in mil_stats.items()})
+        else:
+            mil_stats = {}
 
-        use_vm = (
-            stage == "train"
-            and self.vm is not None
-            and self.vm_lambda > 0.0
-        )
+        # -------------------------
+        # LM (optional)
+        # -------------------------
+        if (self.lambda_lm > 0.0) or (self.lambda_ar > 0.0) or (not self.optimize_unused):
+            ce_loss, _, _, attns, labels, image_features, image_feature_map = self.calculate_ce_loss(
+                y,
+                y_len,
+                x=x_anchor,
+                outputs=text_outputs,
+                image_features=image_features,
+                image_feature_map=image_feature_map,
+                return_image_features=True,
+                tokenwise=True,
+                weight=ce_weight,
+            )
 
-        if stage == "train" and use_vm:
-            if batch_meta is not None and isinstance(batch_meta, dict):
-                sam_mask = batch_meta.get("sam_mask", None)              # (B,K,1,H,W)
-                sam_concept_id = batch_meta.get("sam_mask_concept_id", None)  # (B,K)
-
-                if sam_mask is not None and sam_concept_id is not None:
-                    B, C, H, W = x.shape
-                    Bm, K, _, Hm, Wm = sam_mask.shape
-                    if Bm != B or Hm != H or Wm != W:
-                        raise ValueError(
-                            f"sam_mask shape mismatch: images {x.shape}, masks {sam_mask.shape}"
-                        )
-
-                    sam_mask_flat = sam_mask.view(B * K, 1, H, W)
-                    cid_flat = sam_concept_id.view(B * K)
-
-                    total_objs = sam_mask_flat.size(0)
-                    if total_objs > 0:
-                        vm_cid_min = cid_flat.min().float()
-                        vm_cid_max = cid_flat.max().float()
-
-                    valid = cid_flat >= 0
-
-                    if total_objs > 0:
-                        num_valid = valid.sum().float()
-
-                    if valid.any():
-                        cid_flat = cid_flat[valid]
-                        masks_valid = sam_mask_flat[valid]  # (N_obj,1,H,W)
-
-                        # optional verbose print for early steps on rank 0
-                        if (
-                            self.vm_debug_verbose
-                            and self._get_global_rank() == 0
-                            and int(getattr(self, "global_step", 0)) < 10
-                        ):
-                            print(
-                                f"[VM-debug] step {int(self.global_step)}: "
-                                f"B={B}, K={K}, total_objs={total_objs}, "
-                                f"num_valid={int(num_valid.item())}"
-                            )
-                            print(
-                                f"[VM-debug]   cid range: "
-                                f"[{int(vm_cid_min.item())}, {int(vm_cid_max.item())}]"
-                            )
-
-                        # optional mask overlays to W&B
-                        log_every = int(self.vm_debug_log_images_every or 0)
-                        if (
-                            log_every > 0
-                            and self._get_global_rank() == 0
-                        ):
-                            step_int = int(getattr(self, "global_step", 0))
-                            if step_int % log_every == 0:
-                                try:
-                                    with torch.no_grad():
-                                        imgs_viz = self._unnorm_for_viz(x.detach())
-                                        sel_imgs, sel_masks, sel_concepts = sample_masks_per_concept_for_viz(
-                                            imgs_viz,
-                                            sam_mask,
-                                            sam_concept_id,
-                                            num_concepts=getattr(self.vm, "num_concepts", 1),
-                                            max_per_concept=2,
-                                        )
-                                        if sel_imgs.numel() > 0:
-                                            self._log_vm_prompt_panels_to_wandb(
-                                                tag=f"{stage}/vm_prompt",
-                                                imgs=sel_imgs,
-                                                masks=sel_masks,
-                                                concept_ids=sel_concepts,
-                                                max_images=16,
-                                                overlay_alpha=0.4,
-                                            )
-                                except Exception as e:
-                                    if (
-                                        self.vm_debug_verbose
-                                        and self._get_global_rank() == 0
-                                    ):
-                                        print(
-                                            f"[VM-debug] mask overlay logging failed: {e}"
-                                        )
-
-                        # broadcast x over K and pick valid ones
-                        x_exp = x.unsqueeze(1).expand(B, K, C, H, W).reshape(B * K, C, H, W)
-                        x_valid = x_exp[valid]          # (N_obj,3,H,W)
-                        # --- blurred background fill to avoid hard cutout artifacts ---
-                        blur_ksize = int(self.args.get("vm_bg_blur_kernel", 23))
-                        blur_sigma = float(self.args.get("vm_bg_blur_sigma", 5.0))
-
-                        # blur full images once (B,3,H,W), then broadcast to (B*K,3,H,W) and select valid
-                        x_blur = gaussian_blur2d(x, kernel_size=blur_ksize, sigma=blur_sigma)  # (B,3,H,W)
-                        x_blur_exp = x_blur.unsqueeze(1).expand(B, K, C, H, W).reshape(B * K, C, H, W)
-                        x_bg_valid = x_blur_exp[valid]  # (N_obj,3,H,W)
-
-                        ring_px = int(self.args.get("vm_ctx_ring_px", 0))
-                        ring_strength = float(self.args.get("vm_ctx_ring_strength", 1.0))
-                        feather_sigma = float(self.args.get("vm_mask_feather_sigma", 0.0))
-                        feather_kernel = int(self.args.get("vm_mask_feather_kernel", 0))
-                        feather_kernel = None if feather_kernel <= 0 else feather_kernel
-
-                        alpha_mask = make_context_alpha(
-                            masks_valid,                   # (N_obj,1,H,W)
-                            ring_px=ring_px,
-                            ring_strength=ring_strength,
-                            feather_sigma=feather_sigma,
-                            feather_kernel=feather_kernel,
-                        )  # (N_obj,1,H,W) in [0,1]
-
-                        masked_rgb = x_valid * alpha_mask + x_bg_valid * (1.0 - alpha_mask)
-
-                        # encode masked RGB for global and fmap
-                        obj_global_feat, obj_fmap = self.model.encode_image(masked_rgb)
-                        # ensure fmap for full images is available for downstream modules
-                        if image_feature_map is None:
-                            _, image_feature_map = self.model.encode_image(x)
-
-                        Cf, Hf, Wf = obj_fmap.shape[1:]
-                        masks_ds = F.interpolate(masks_valid, size=(Hf, Wf), mode="nearest")
-                        obj_local_feat = masked_spatial_pool(obj_fmap, masks_ds)  # (N_obj,Cf)
-
-                        # lazy init of object appearance encoder once we know dims
-                        if self.obj_encoder is None:
-                            self.obj_encoder = ObjectAppearanceEncoder(
-                                dim_global=obj_global_feat.size(-1),
-                                dim_local=obj_local_feat.size(-1),
-                                dim_out=self.vm_obj_out_dim,
-                                use_local=True,
-                                local_weight=float(self.args.get("vm_local_weight", 1.0)),
-                                learn_local_weight=bool(self.args.get("vm_learn_local_weight", False)),
-                            ).to(self.device)
-
-                        z_obj = self.obj_encoder(
-                            global_feat=obj_global_feat,
-                            local_feat=obj_local_feat,
-                        )  # (N_obj, Dvm)
-
-                        reg_lambda = float(self.args.get("vm_local_weight_reg_lambda", 0.0))
-                        if reg_lambda > 0.0 and self.obj_encoder is not None:
-                            w = getattr(self.obj_encoder, "local_weight", None)
-                            if w is not None and w.requires_grad:
-                                # anchor to the initialization value (vm_local_weight)
-                                w_init = float(self.args.get("vm_local_weight", 1.0))
-
-                                decay_steps = int(self.args.get("vm_local_weight_reg_decay_steps", 0))
-                                if decay_steps > 0:
-                                    decay = max(0.0, 1.0 - float(self.global_step) / float(decay_steps))
-                                else:
-                                    decay = 1.0
-
-                                vm_lw_reg = (w - w.new_tensor(w_init)).pow(2) * (reg_lambda * decay)
-
-                                log(f"{stage}/vm_local_weight_value", w)
-                                log(f"{stage}/vm_local_weight_reg", vm_lw_reg)
-
-                                ret.update({
-                                    "vm_local_weight_value": w.detach(),
-                                    "vm_local_weight_reg": vm_lw_reg.detach(),
-                                })
-
-                        # build per-object temporal metadata
-                        clip_ids = batch_meta.get("clip_id", None)
-                        frame_idx = batch_meta.get("frame_idx", None)
-                        obj_meta = None
-                        if clip_ids is not None and frame_idx is not None:
-                            # flatten to Python lists
-                            if isinstance(clip_ids, torch.Tensor):
-                                clip_ids_list = clip_ids.tolist()
-                            else:
-                                clip_ids_list = list(clip_ids)
-
-                            if isinstance(frame_idx, torch.Tensor):
-                                frame_idx_list = frame_idx.tolist()
-                            else:
-                                frame_idx_list = list(frame_idx)
-
-                            assert len(clip_ids_list) == B and len(frame_idx_list) == B, \
-                                "clip_id and frame_idx must have length B"
-
-                            # convert clip IDs to numeric IDs so torch.as_tensor works
-                            clip_ids_numeric = [
-                                abs(hash(c)) % (1 << 31) if isinstance(c, str) else int(c)
-                                for c in clip_ids_list
-                            ]
-
-                            obj_clip_ids = []
-                            obj_frame_idx = []
-                            for b in range(B):
-                                for _k in range(K):
-                                    obj_clip_ids.append(clip_ids_numeric[b])
-                                    obj_frame_idx.append(frame_idx_list[b])
-
-                            # valid is boolean mask over B*K objects
-                            obj_clip_ids = torch.as_tensor(
-                                obj_clip_ids, device=x.device, dtype=torch.long
-                            )[valid]
-                            obj_frame_idx = torch.as_tensor(
-                                obj_frame_idx, device=x.device, dtype=torch.long
-                            )[valid]
-
-                            obj_meta = {
-                                "clip_id": obj_clip_ids,
-                                "frame_idx": obj_frame_idx,
-                            }
-
-                        # call VM loss (usage-based weighting happens inside VisualMemory)
-                        vm_total, vm_q, vm_temp, vm_sep = self.vm.loss(
-                            feats=z_obj,
-                            concept_ids=cid_flat,
-                            batch_meta=obj_meta,
-                        )
-
-                        # log histogram of mask-instance counts per concept to W&B
-                        self._log_vm_histogram_to_wandb(stage)
-
-                        # optional warmup: zero out VM loss contribution during initial steps
-                        if int(getattr(self, "global_step", 0)) < self.vm_warmup_steps:
-                            vm_total = vm_total.detach() * 0.0
-                            vm_q = vm_q.detach() * 0.0
-                            vm_temp = vm_temp.detach() * 0.0
-                            vm_sep = vm_sep.detach() * 0.0
-
-                        # prototype usage statistics (from VisualMemory.loss)
-                        assign_hist = getattr(self.vm, "_last_assign_hist", None)
-                        if assign_hist is not None and isinstance(assign_hist, torch.Tensor) and assign_hist.numel() > 0:
-                            assign_hist = assign_hist.to(x.device)
-                            vm_num_active_protos = (assign_hist > 0).float().sum()
-                            vm_frac_active_protos = vm_num_active_protos / float(assign_hist.numel())
-
-                            if (
-                                self.vm_debug_verbose
-                                and self._get_global_rank() == 0
-                                and int(getattr(self, "global_step", 0)) < 10
-                            ):
-                                print(
-                                    "[VM-debug] active prototypes this batch: "
-                                    f"{int(vm_num_active_protos.item())}/{assign_hist.numel()} "
-                                    f"({float(vm_frac_active_protos.item()) * 100:.1f} percent)"
-                                )
-
-                        if (
-                            self.vm_debug_verbose
-                            and self._get_global_rank() == 0
-                            and int(getattr(self, "global_step", 0)) < 10
-                        ):
-                            print(
-                                "[VM-debug] losses: "
-                                f"L_total={float(vm_total.item()):.4f}, "
-                                f"L_q={float(vm_q.item()):.4f}, "
-                                f"L_temp={float(vm_temp.item()):.4f}, "
-                                f"L_sep={float(vm_sep.item()):.4f}"
-                            )
-
-        # log and attach VM metrics for training (as zeros if VM enabled but no valid objects)
-        if stage == "train" and use_vm:
-            log(f"{stage}/vm_loss_total", vm_total)
-            log(f"{stage}/vm_loss_quant", vm_q)
-            log(f"{stage}/vm_loss_temp", vm_temp)
-            log(f"{stage}/vm_loss_sep", vm_sep)
-
-            ret.update({
-                'vm_loss_total': vm_total.detach(),
-                'vm_loss_quant': vm_q.detach(),
-                'vm_loss_temp': vm_temp.detach(),
-                'vm_loss_sep': vm_sep.detach(),
-            })
-
-        # ------------------------------------------------------------------
-        # GradCAM debug logging (side forward pass)
-        # ------------------------------------------------------------------
-        self._log_gradcam_debug_images(
-            images=x,
-            y=y,
-            y_len=y_len,
-            stage=stage,
-            batch_idx=batch_idx,
-        )
-
-        # -------- NeSy --------
-        ns_exist = torch.tensor(0.0, device=x.device)
-        ns_hier = torch.tensor(0.0, device=x.device)
-        pos_mask_ns = None
-
-        if self.args.get("neurosym", False) and self.concepts is not None:
-            concept_logits = self.vision_encoder.concept_logits(
-                image_features, image_feature_map=image_feature_map
-            )  # (B,C)
-            raw_y_tokens = [self.decode_ids_to_tokens(u) for u in raw_y]
-            pos_mask_ns = build_targets(raw_y_tokens, self.concepts).to(concept_logits.device)  # (B,C)
-            try:
-                if self.global_step < 3 and getattr(self, "local_rank", 0) == 0:
-                    hits = pos_mask_ns.nonzero(as_tuple=False)
-                    print(
-                        f"[NeSy] step {self.global_step} - coverage:",
-                        float((pos_mask_ns.sum(dim=1) > 0).float().mean())
-                    )
-                    if hits.numel():
-                        b = int(hits[0, 0])
-                        on = [self.concepts[i] for i in pos_mask_ns[b].nonzero().flatten().tolist()]
-                        print(f"[NeSy] sample tokens:", raw_y_tokens[b][:20])
-                        print(f"[NeSy] sample mentions ->", on)
-            except Exception:
-                pass
-            pos_mask_leaf = mask_hypernyms_when_hyponyms_present(pos_mask_ns, self.ns_edges)
-
-            cw = None if self.ns_class_weights is None else self.ns_class_weights.to(concept_logits.device)
-            ns_exist = existential_soft_or_loss(concept_logits, pos_mask_leaf, class_weights=cw)
-            log(f"{stage}/ns_exist_loss", ns_exist, batch_size=ret['batch_size'])
-
-            if self.args.get("ns_lambda_hier", 0.0) > 0 and len(self.ns_edges):
-                ew = self.ns_edge_weights.to(concept_logits.device) if self.ns_edge_weights is not None else None
-                ns_hier = implication_hinge_loss(concept_logits, self.ns_edges, edge_weights=ew)
-                log(f"{stage}/ns_hier_loss", ns_hier, batch_size=ret['batch_size'])
-
-            ns_cov = (pos_mask_ns.sum(dim=1) > 0).float().mean()
-            ns_avg_mentions = (pos_mask_ns.sum() / max(1, pos_mask_ns.size(0))).item()
-            log(f"{stage}/ns_coverage", ns_cov, prog_bar=True, batch_size=ret['batch_size'])
-            log(f"{stage}/ns_avg_mentions", ns_avg_mentions, batch_size=ret['batch_size'])
-
-            ret.update({
-                'ns_exist_loss': ns_exist.detach(),
-                'ns_hier_loss': ns_hier.detach() if torch.is_tensor(ns_hier) else ns_hier,
-            })
-
-        # -------- LM --------
-        if self.lambda_lm or not self.optimize_unused:
-            # calculate language model ce loss
-            ce_loss, _, _, attns, labels, image_features, image_feature_map = \
-                self.calculate_ce_loss(
-                    y, y_len, x=x,
-                    outputs=text_outputs,
-                    image_features=image_features,
-                    image_feature_map=image_feature_map,
-                    return_image_features=True,
-                    tokenwise=True,
-                    weight=ce_weight,
-                )
-
-            # get all kinds of losses with/without special tokens
-            # In torch.nn.CrossEntropyLoss the sum of loss should be
-            # divided by the sum of mask weighted by the weight.
-            # Here it ignores the weight for simplicity.
-
-            # standard loss including all special tokens
-            mask = (labels != PAD_TOKEN_ID)
+            mask = labels != PAD_TOKEN_ID
             n_tokens = mask.sum()
             lm_ce_loss = ce_loss.sum() / n_tokens
 
-            mask = mask & (labels != SOS_TOKEN_ID)
-            n_tokens_wo_sos = mask.sum()
-            lm_ce_loss_wo_sos = (ce_loss * mask).sum() / n_tokens_wo_sos
+            log(f"{stage}/ce_loss", lm_ce_loss)
+            ret.update({"ce_loss": lm_ce_loss.detach(), "n_tokens": n_tokens})
 
-            mask = mask & (labels != EOS_TOKEN_ID)
-            n_tokens_wo_sos_eos = mask.sum()
-            lm_ce_loss_wo_sos_eos = (ce_loss * mask).sum() / n_tokens_wo_sos_eos
-
-            # log
-            log(f"{stage}/ce_loss", lm_ce_loss, batch_size=ret['batch_size'])
-            log(f"{stage}/ce_loss_wo_sos", lm_ce_loss_wo_sos, batch_size=ret['batch_size'])
-            log(f"{stage}/ce_loss_wo_sos_eos", lm_ce_loss_wo_sos_eos, batch_size=ret['batch_size'])
-
-            ret.update({
-                'ce_loss': lm_ce_loss.detach(),
-                'ce_loss_wo_sos': lm_ce_loss_wo_sos.detach(),
-                'ce_loss_wo_sos_eos': lm_ce_loss_wo_sos_eos.detach(),
-                'n_tokens': n_tokens,
-                'n_tokens_wo_sos': n_tokens_wo_sos,
-                'n_tokens_wo_sos_eos': n_tokens_wo_sos_eos,
-            })
-
-            # attention regularization loss
-            if self.language_model.text_encoder.has_attention:
+            if self.language_model.text_encoder.has_attention and (self.lambda_ar > 0.0):
                 attn_reg_loss = calculate_attn_reg_loss(attns)
-
-                # log
-                log(f"{stage}/attn_reg_loss", attn_reg_loss, batch_size=ret['batch_size'])
-
-                ret.update({
-                    'attn_reg_loss': attn_reg_loss.detach(),
-                })
+                log(f"{stage}/attn_reg_loss", attn_reg_loss)
+                ret["attn_reg_loss"] = attn_reg_loss.detach()
             else:
-                attn_reg_loss = torch.tensor(0.0, device=x.device)
+                attn_reg_loss = x_anchor.new_tensor(0.0)
 
             if eval_textgen:
                 beam_seq, log_prob = self.language_model.beam_search_decode(
-                    batch_size=ret['batch_size'],
+                    batch_size=ret["batch_size"],
                     beam_width=self.beam_width,
                     decode_length=self.decode_length,
                     length_penalty_alpha=self.length_penalty_alpha,
-                    image_features=image_features
-                        if self.language_model.text_encoder.captioning else None,
-                    image_feature_map=image_feature_map
-                        if self.language_model.text_encoder.has_attention else None,
+                    image_features=image_features if self.language_model.text_encoder.captioning else None,
+                    image_feature_map=image_feature_map if self.language_model.text_encoder.has_attention else None,
                 )
 
                 def ids_to_sentence(y_ids):
@@ -1808,353 +2463,222 @@ class MultiModalLitModel(pl.LightningModule):
                         y_list = y_list[:-1]
                     if len(y_list) > 0 and y_list[0] == SOS_TOKEN_ID:
                         y_list = y_list[1:]
-                    return ' '.join(self.text_encoder.idx2word[idx] for idx in y_list)
+                    return " ".join(self.text_encoder.idx2word[idx] for idx in y_list)
 
                 gen_text_ids = beam_seq[:, 0]
                 gen_text = [ids_to_sentence(y_seq) for y_seq in gen_text_ids]
-
-                ret.update({
-                    'raw_y': raw_y,
-                    'gen_text': gen_text,
-                })
-
+                ret.update({"raw_y": raw_y, "gen_text": gen_text})
         else:
-            lm_ce_loss = torch.tensor(0.0, device=x.device)
-            attn_reg_loss = torch.tensor(0.0, device=x.device)
+            lm_ce_loss = x_anchor.new_tensor(0.0)
+            attn_reg_loss = x_anchor.new_tensor(0.0)
+            lm_ce_loss = self._tie_module_params_if_needed(lm_ce_loss, self.language_model)
 
-        # -------- total loss --------
+        # -------------------------
+        # Total
+        # -------------------------
         loss = (
-            self.lambda_mm * infonce_loss
-            + self.lambda_lm * lm_ce_loss
-            + self.lambda_ar * attn_reg_loss
-            + self.args.get("ns_lambda_exist", 0.0) * ns_exist
-            + self.args.get("ns_lambda_hier", 0.0) * ns_hier
-            + self.vm_lambda * vm_total
-            + vm_lw_reg
+            float(self.lambda_mm) * infonce_loss
+            + float(self.lambda_lm) * lm_ce_loss
+            + float(self.lambda_ar) * attn_reg_loss
+            + aux_mil
         )
-        log(f"{stage}/loss", loss, batch_size=ret['batch_size'])
 
-        ret.update({
-            'loss': loss,
-        })
+        # DDP safety: these params are only used by the MIL/proto branch.
+        # (Safe to tie even if they were used; it adds a 0-weight term.)
+        if self.null_obj is not None:
+            loss = self._tie_params_if_needed(loss, [self.null_obj])
+        if self.img_adapter is not None:
+            loss = self._tie_params_if_needed(loss, list(self.img_adapter.parameters()))
 
+        log(f"{stage}/loss", loss)
+        ret["loss"] = loss
         return ret
 
-    def joint_loss_epoch_end(self, outputs, stage, log, eval_textgen=False):
-        """
-        Epoch-end aggregation that is safe under DDP.
-
-        Instead of logging per-rank means with sync_dist=True (which can be biased
-        if ranks see different numbers of examples), we sum numerators and
-        denominators and all-reduce the sums.
-        """
-        device = self.device if hasattr(self, "device") else torch.device("cpu")
-
-        def _as_float_tensor(v):
-            if v is None:
-                return None
-            if torch.is_tensor(v):
-                return v.detach().to(device).float()
-            return torch.tensor(float(v), device=device, dtype=torch.float32)
-
-        def _sum_all(t: torch.Tensor) -> torch.Tensor:
-            if _dist_is_initialized() and _dist_world_size() > 1:
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            return t
-
-        def mean_over_examples(name):
-            local_sum = torch.tensor(0.0, device=device)
-            local_n = torch.tensor(0.0, device=device)
-
+    # ------------------------------------------------------------------
+    # Epoch-end aggregation
+    # ------------------------------------------------------------------
+    def joint_loss_epoch_end(self, outputs, stage, log, eval_textgen: bool = False):
+        def mean_over_examples(name: str) -> float:
+            n_examples = 0
+            value_sum = 0.0
             for output in outputs:
-                bs = output.get("batch_size", 0)
-                bs_t = _as_float_tensor(bs) if bs is not None else torch.tensor(0.0, device=device)
-
-                val = output.get(name, None)
-                if val is None:
+                batch_size = int(output["batch_size"])
+                value = output.get(name, None)
+                if value is None:
                     continue
+                value_f = float(value.item()) if torch.is_tensor(value) else float(value)
+                n_examples += batch_size
+                value_sum += value_f * batch_size
+            return value_sum / n_examples if n_examples > 0 else 0.0
 
-                val_t = _as_float_tensor(val)
-
-                # If metric is a vector (eg, per-example), reduce it to a scalar mean first
-                if torch.is_tensor(val_t) and val_t.ndim > 0:
-                    val_t = val_t.mean()
-
-                local_sum += val_t * bs_t
-                local_n += bs_t
-
-            local_sum = _sum_all(local_sum)
-            local_n = _sum_all(local_n)
-            return local_sum / local_n.clamp(min=1.0)
-
-        def mean_over_tokens(name, n_tokens_name):
-            local_sum = torch.tensor(0.0, device=device)
-            local_n = torch.tensor(0.0, device=device)
-
+        def mean_over_tokens(name: str, n_tokens_name: str) -> float:
+            n_tokens_sum = 0
+            value_sum = 0.0
             for output in outputs:
                 if name not in output or n_tokens_name not in output:
                     continue
-                n_tok = _as_float_tensor(output[n_tokens_name])
-                val = _as_float_tensor(output[name])
-                local_sum += val * n_tok
-                local_n += n_tok
+                n_tokens = int(output[n_tokens_name].item())
+                value = float(output[name].item())
+                n_tokens_sum += n_tokens
+                value_sum += value * n_tokens
+            return value_sum / n_tokens_sum if n_tokens_sum > 0 else 0.0
 
-            local_sum = _sum_all(local_sum)
-            local_n = _sum_all(local_n)
-            return local_sum / local_n.clamp(min=1.0)
-
-        def mean_over_batches(name):
-            local_sum = torch.tensor(0.0, device=device)
-            local_n = torch.tensor(0.0, device=device)
-            for output in outputs:
-                if name in output:
-                    local_sum += _as_float_tensor(output[name])
-                    local_n += 1.0
-            local_sum = _sum_all(local_sum)
-            local_n = _sum_all(local_n)
-            return local_sum / local_n.clamp(min=1.0)
-
-        # Only log on global zero to avoid duplicate logger writes.
-        is_global_zero = True
-        trainer = getattr(self, "trainer", None)
-        if trainer is not None and hasattr(trainer, "is_global_zero"):
-            is_global_zero = bool(trainer.is_global_zero)
-        else:
-            is_global_zero = (self._get_global_rank() == 0)
-
+        # Contrastive
         if self.lambda_mm or not self.optimize_unused:
-            for name in (
-                'infonce_loss', 'image_accuracy', 'text_accuracy',
-                'image_entropy', 'text_entropy',):
-                value = mean_over_examples(name)
-                if is_global_zero:
-                    log(f"{stage}/{name}", value)
+            for name in ("infonce_loss", "retrieval_acc"):
+                if any(name in o for o in outputs):
+                    log(f"{stage}/{name}", mean_over_examples(name))
 
-        if stage == 'train' and self.vm is not None:
+        # MIL/proto (train and optionally val/test)
+        if self.mil_enable and (stage == "train" or self.mil_run_val):
             for name in (
-                'vm_loss_total', 'vm_loss_quant', 'vm_loss_temp', 'vm_loss_sep',
+                "mil_loss",
+                "mil_acc",
+                "mil_acc_t2i",
+                "mil_acc_i2t",
+                "w_align_mean",
+                "w_align_eff_mean",
+                "sam_concept_weight_mean",
+                "track_coh_loss",
+                "track_coh_pairs",
+                "go_loss",
+                "go_sim",
+                "proto_update_loss",
+                "proto_usage_eff_k",
+                "sam_mask_frac",
+                "patch_frac",
+                "noun_count_mean",
+                "noun_sample_frac",
+                "noun_query_frac",
+                "concept_align_loss",
+                "concept_align_acc",
+                "concept_align_n",
             ):
-                value = mean_over_batches(name)
-                if is_global_zero:
-                    log(f"{stage}/{name}", value)
+                if any(name in o for o in outputs):
+                    log(f"{stage}/{name}", mean_over_examples(name))
 
-        if self.lambda_lm or not self.optimize_unused:
-            for suffix in ('', '_wo_sos', '_wo_sos_eos'):
-                value_mean = mean_over_tokens(
-                    f'ce_loss{suffix}', f'n_tokens{suffix}')
-                if is_global_zero:
-                    log(f"{stage}/ce_loss{suffix}", value_mean)
+        # LM
+        if (self.lambda_lm > 0.0) or (self.lambda_ar > 0.0) or (not self.optimize_unused):
+            if any("ce_loss" in o for o in outputs):
+                ce_mean = mean_over_tokens("ce_loss", "n_tokens")
+                log(f"{stage}/ce_loss", ce_mean)
+                log(f"{stage}/perplexity", float(np.exp(ce_mean)))
 
-                # perplexity
-                perplexity = float(np.exp(float(value_mean.item())))
-                if is_global_zero:
-                    log(f"{stage}/perplexity{suffix}", perplexity)
+            if any("attn_reg_loss" in o for o in outputs):
+                log(f"{stage}/attn_reg_loss", mean_over_examples("attn_reg_loss"))
 
-            if self.language_model.text_encoder.has_attention:
-                for name in ('attn_reg_loss',):
-                    value = mean_over_examples(name)
-                    if is_global_zero:
-                        log(f"{stage}/{name}", value)
+        if eval_textgen:
+            list_of_references, hypotheses = [], []
+            for output in outputs:
+                list_of_references += output["raw_y"]
+                hypotheses += output["gen_text"]
 
-            if eval_textgen:
-                # Gather references/hypotheses across ranks to compute global textgen metrics.
-                list_of_references, hypotheses = [], []
-                for output in outputs:
-                    list_of_references += output.get('raw_y', [])
-                    hypotheses += output.get('gen_text', [])
+            list_of_references = _ddp_all_gather_object_list(list_of_references)
+            hypotheses = _ddp_all_gather_object_list(hypotheses)
 
-                if _dist_is_initialized() and _dist_world_size() > 1:
-                    gathered_refs = [None for _ in range(_dist_world_size())]
-                    gathered_hyps = [None for _ in range(_dist_world_size())]
-                    dist.all_gather_object(gathered_refs, list_of_references)
-                    dist.all_gather_object(gathered_hyps, hypotheses)
+            if (self.trainer is None) or self.trainer.is_global_zero:
+                for example_id in PRINT_EVAL_TEXTGEN_EXAMPLE_IDS:
+                    if example_id >= len(hypotheses):
+                        continue
+                    print(f"example #{example_id}:")
+                    references = list_of_references[example_id]
+                    hypothesis = hypotheses[example_id]
+                    print("references:")
+                    print("\n".join(references))
+                    print("hypothesis:")
+                    print(hypothesis)
 
-                    if is_global_zero:
-                        all_refs = []
-                        all_hyps = []
-                        for r in gathered_refs:
-                            if r:
-                                all_refs.extend(r)
-                        for h in gathered_hyps:
-                            if h:
-                                all_hyps.extend(h)
-                        list_of_references = all_refs
-                        hypotheses = all_hyps
-                    else:
-                        list_of_references = []
-                        hypotheses = []
+                score_dict = textgen_eval(list_of_references, hypotheses)
+                for metric, score in score_dict.items():
+                    self.log(f"{stage}/{metric}", score, on_step=False, on_epoch=True, prog_bar=False, sync_dist=False)
 
-                score_dict = {}
-                if is_global_zero:
-                    for example_id in PRINT_EVAL_TEXTGEN_EXAMPLE_IDS:
-                        if example_id >= len(hypotheses):
-                            break
-                        print(f"example #{example_id}:")
-                        references = list_of_references[example_id]
-                        hypothesis = hypotheses[example_id]
-                        print("references:")
-                        print("\n".join(references))
-                        print("hypothesis:")
-                        print(hypothesis)
+        log(f"{stage}/loss", mean_over_examples("loss"))
 
-                    score_dict = textgen_eval(list_of_references, hypotheses)
-
-                # Broadcast score_dict from rank 0 so all ranks have it (avoids None issues)
-                if _dist_is_initialized() and _dist_world_size() > 1:
-                    obj_list = [score_dict]
-                    dist.broadcast_object_list(obj_list, src=0)
-                    score_dict = obj_list[0]
-
-                if is_global_zero:
-                    for metric, score in score_dict.items():
-                        log(f"{stage}/{metric}", score)
-
-        for name in ('loss',):
-            value = mean_over_examples(name)
-            if is_global_zero:
-                log(f"{stage}/{name}", value)
-
+    # ------------------------------------------------------------------
+    # Lightning hooks
+    # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         try:
             lr = self.trainer.optimizers[0].param_groups[0]["lr"]
             self.log("train/lr", lr, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         except Exception:
             pass
-
-        step_log = functools.partial(self.log, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        return self.calculate_joint_loss(
-            batch, 'train', step_log, batch_idx, eval_textgen=False)
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        if not self.trainer.is_global_zero:
-            return
-        if (self.global_step % 500) != 0:
-            return
-        if self.vm is None:
-            return
-
-        self.vm.wandb_log_concept_mean_weight_bar(
-            step=self.global_step,
-            prefix="train/vm",
-        )
-        self.vm.wandb_log_proto_utilization_per_concept(
-            step=self.global_step,
-            prefix="train/vm",
-            use_batch_hist=False,
-        )
+        return self.calculate_joint_loss(batch, "train", self.log, batch_idx, eval_textgen=False)
 
     def training_epoch_end(self, outputs):
-        # Epoch metrics are reduced inside joint_loss_epoch_end (DDP-safe), so do not use sync_dist=True here.
-        log = functools.partial(self.log, on_step=False, on_epoch=True, sync_dist=False)
-        return self.joint_loss_epoch_end(outputs, 'train', log, eval_textgen=False)
+        log = functools.partial(self.log, on_step=False, on_epoch=True, sync_dist=True)
+        ret = self.joint_loss_epoch_end(outputs, "train", log, eval_textgen=False)
+        self._debug_save_top_tracks_epoch_end()
+        return ret
 
-    def validation_test_step(self, stage, batch, batch_idx, dataloader_idx=0):
-        ret = {}
+    def validation_test_step(self, stage, batch, batch_idx, dataloader_idx: int = 0):
+        log = functools.partial(self.log, on_step=False, on_epoch=True, sync_dist=True)
+        ret: Dict[str, Any] = {}
 
         if dataloader_idx == 0:
-            val_log = functools.partial(
-                self.log,
-                on_step=False,
-                on_epoch=True,
-                prog_bar=False,
-                sync_dist=True,
-                add_dataloader_idx=False,  # important: keeps the key as "val/loss"
-            )
-            ret.update(self.calculate_joint_loss(
-                batch, stage, val_log, batch_idx, eval_textgen=self.eval_textgen
-            ))
-
+            empty_log = lambda *args, **kwargs: None
+            ret.update(self.calculate_joint_loss(batch, stage, empty_log, batch_idx, eval_textgen=self.eval_textgen))
         elif dataloader_idx == 1:
             x, y, y_len, raw_y, _ = self._split_batch(batch)
-
-            # resize x so images from the same trial are in the batch dim
-            # [B, N, C, H, W] -> [B*N, C, H, W]  (with B = 1)
             x = x.view(-1, *x.shape[-3:])
 
             if self.lambda_mm:
                 logits_per_image, logits_per_text = self.model(x, y, y_len)
-                logits = logits_per_text[0]  # get logits per trial
-
-            elif self.lambda_lm and (
-                    self.language_model.text_encoder.captioning or
-                    self.language_model.text_encoder.has_attention) \
-                    and y[0, 0].item() == SOS_TOKEN_ID:
-                # tile y to match the batch size
+                logits = logits_per_text[0]
+            elif (
+                (self.lambda_lm > 0.0)
+                and (self.language_model.text_encoder.captioning or self.language_model.text_encoder.has_attention)
+                and y[0, 0].item() == SOS_TOKEN_ID
+            ):
                 y = y.expand(x.size(0), -1)
                 y_len = y_len.expand(x.size(0))
-
-                # calculate language model ce loss
-                ce_loss, _, _, _, labels = self.calculate_ce_loss(
-                    y, y_len, x=x, tokenwise=True)
-
-                # use - ce_loss on the word as logits
-                logits = - ce_loss[:, 0]
-
+                ce_loss, _, _, _, labels = self.calculate_ce_loss(y, y_len, x=x, tokenwise=True)
+                logits = -ce_loss[:, 0]
             else:
                 logits = None
 
             if logits is not None:
-                # calculate accuracy
                 pred = torch.argmax(logits).item()
-                label = 0  # correct answer is always the first item
-                accuracy = float(pred == label)
+                label = 0
+                accuracy = int(pred == label)
                 entropy = get_entropy(logits)
 
-                # log evaluation accuracy and entropy
-                self.log(f"{stage}/accuracy", accuracy, batch_size=1)
-                self.log(f"{stage}/entropy", entropy, batch_size=1)
+                log(f"{stage}/accuracy", accuracy)
+                log(f"{stage}/entropy", entropy)
 
-                # log category-level evaluation accuracies as a separate metric
                 category_label = raw_y[0][0]
-                self.log(f"{stage}/accuracy_{category_label}", accuracy, batch_size=1)
-
-                ret.update({'accuracy': accuracy})
+                log(f"{stage}/accuracy_{category_label}", accuracy)
+                ret.update({"accuracy": accuracy})
 
         return ret
 
     def validation_test_epoch_end(self, stage, outputs):
-        # Epoch metrics are reduced inside joint_loss_epoch_end (DDP-safe), so do not use sync_dist=True here.
-        log = functools.partial(self.log, on_step=False, on_epoch=True, sync_dist=False)
-        return self.joint_loss_epoch_end(
-            outputs[0], stage, log, eval_textgen=self.eval_textgen)
+        log = functools.partial(self.log, on_step=False, on_epoch=True, sync_dist=True)
+        return self.joint_loss_epoch_end(outputs[0], stage, log, eval_textgen=self.eval_textgen)
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        if dataloader_idx < N_VAL_DATALOADERS_PER_SPLIT:  # as normal
-            return self.validation_test_step(
-                'val', batch, batch_idx, dataloader_idx=dataloader_idx)
-        else:  # actually a test_step
-            return self.test_step(
-                batch, batch_idx,
-                dataloader_idx=dataloader_idx - N_VAL_DATALOADERS_PER_SPLIT)
+        if dataloader_idx < N_VAL_DATALOADERS_PER_SPLIT:
+            return self.validation_test_step("val", batch, batch_idx, dataloader_idx=dataloader_idx)
+        return self.test_step(batch, batch_idx, dataloader_idx=dataloader_idx - N_VAL_DATALOADERS_PER_SPLIT)
 
     def validation_epoch_end(self, outputs):
-        self.validation_test_epoch_end(
-            'val', outputs[:N_VAL_DATALOADERS_PER_SPLIT])
+        self.validation_test_epoch_end("val", outputs[:N_VAL_DATALOADERS_PER_SPLIT])
         if len(outputs) > N_VAL_DATALOADERS_PER_SPLIT:
             self.test_epoch_end(outputs[N_VAL_DATALOADERS_PER_SPLIT:])
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
-        return self.validation_test_step(
-            'test', batch, batch_idx, dataloader_idx=dataloader_idx)
+        return self.validation_test_step("test", batch, batch_idx, dataloader_idx=dataloader_idx)
 
     def test_epoch_end(self, outputs):
-        return self.validation_test_epoch_end(
-            'test', outputs)
+        return self.validation_test_epoch_end("test", outputs)
 
     def on_before_zero_grad(self, optimizer) -> None:
-        """Runs right after optimizer.step() and before zero_grad().
-        In PL 1.9 this is the safest spot to read (unscaled) grads."""
-        # total L2 grad norm over all params that have grads
+        """Runs right after optimizer.step() and before zero_grad()."""
+
         grads = [p.grad for p in self.parameters() if p.grad is not None]
         if grads:
             total = torch.norm(torch.stack([g.detach().float().norm(2) for g in grads]), 2)
-            self.log(
-                "train/grad_norm",
-                total,
-                on_step=True, on_epoch=False, prog_bar=False, sync_dist=True
-            )
-
-        # (nice to have) log current LR as well
+            self.log("train/grad_norm", total, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         try:
             lr = optimizer.param_groups[0]["lr"]
             self.log("train/lr", lr, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
